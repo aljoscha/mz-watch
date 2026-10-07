@@ -28,7 +28,10 @@ pub fn build(b: *std.Build) void {
     });
     test_module.linkSystemLibrary("pq", .{});
     const tests = b.addTest(.{ .root_module = test_module, .use_llvm = llvm });
-    b.step("test", "Run contract tests").dependOn(&b.addRunArtifact(tests).step);
+    const run_tests = b.addRunArtifact(tests);
+    // Cache compilation, not execution of a requested test run.
+    run_tests.has_side_effects = true;
+    b.step("test", "Run contract tests").dependOn(&run_tests.step);
     const integration_module = b.createModule(.{
         .root_source_file = b.path("src/integration.zig"),
         .target = target,

@@ -255,6 +255,20 @@ fn skippedSchedules(a: std.mem.Allocator, io: std.Io, conninfo: []const u8) !voi
     return error.DeadlineExceeded;
 }
 
+fn connectionLoss(a: std.mem.Allocator, io: std.Io, conninfo: []const u8, observer: Observer) !void {
+    var h = Harness.init(a, io);
+    defer h.deinit();
+    try h.prepare(conninfo, "SELECT pg_sleep(CASE current_setting('application_name') WHEN 'fast' THEN 10 ELSE 3 END) /* mz_watch_loss */", 60_000, 20_000, true);
+    try observer.waitFor(&h, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = 'fast' AND state = 'active' AND query LIKE '%mz_watch_loss%')");
+    try expect(try observer.boolean("SELECT coalesce(bool_and(pg_terminate_backend(pid)), false) FROM pg_stat_activity WHERE application_name = 'fast' AND state = 'active' AND query LIKE '%mz_watch_loss%'"), "terminate the in-flight endpoint connection");
+    _ = try h.waitStatus(fast, .connection_error);
+    _ = try h.waitSample(slow);
+    try expect(h.statusIndex(fast, .success) == null, "disconnected endpoint never reports success");
+    const recovered = try h.waitStatus(fast, .ready);
+    try expect(recovered > h.statusIndex(fast, .connection_error).?, "failed endpoint reconnects");
+    std.debug.print("PASS: healthy endpoint wins after in-flight peer loss; failed peer reconnects\n", .{});
+}
+
 fn lifecycle(a: std.mem.Allocator, io: std.Io, conninfo: []const u8, observer: Observer) !void {
     var h = Harness.init(a, io);
     var live = true;
@@ -326,6 +340,7 @@ pub fn main(init: std.process.Init) !void {
     try errors(a, init.io, conninfo, observer);
     try timeouts(a, init.io, conninfo);
     try skippedSchedules(a, init.io, conninfo);
+    try connectionLoss(a, init.io, conninfo, observer);
     try lifecycle(a, init.io, conninfo, observer);
     std.debug.print("PASS: PostgreSQL integration contracts\n", .{});
 }
