@@ -2,9 +2,11 @@
 //! stay on the database thread. No libpq call belongs in a UI event handler.
 pub const Conn = opaque {};
 pub const Result = opaque {};
+pub const NoticeProcessor = *const fn (?*anyopaque, [*:0]const u8) callconv(.c) void;
 
 pub extern "pq" fn PQconnectStart(conninfo: [*:0]const u8) ?*Conn;
 pub extern "pq" fn PQconnectPoll(conn: *Conn) c_int;
+pub extern "pq" fn PQsetNoticeProcessor(conn: *Conn, proc: NoticeProcessor, arg: ?*anyopaque) ?NoticeProcessor;
 pub extern "pq" fn PQstatus(conn: *const Conn) c_int;
 pub extern "pq" fn PQsocket(conn: *const Conn) c_int;
 pub extern "pq" fn PQsetnonblocking(conn: *Conn, arg: c_int) c_int;
@@ -31,3 +33,6 @@ pub const single_tuple = 9;
 pub fn send(conn: *Conn, sql: [:0]const u8) bool {
     return PQsendQueryParams(conn, sql, 0, null, null, null, null, 0) == 1;
 }
+
+/// Server notices are not measurements and must never write into the TUI.
+pub fn discardNotice(_: ?*anyopaque, _: [*:0]const u8) callconv(.c) void {}

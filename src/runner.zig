@@ -317,6 +317,7 @@ const State = struct {
             // during connection establishment, queries or socket operations.
             slot.conn = pq.PQconnectStart(endpoint.conninfo.ptr);
             if (slot.conn == null) return error.OutOfMemory;
+            _ = pq.PQsetNoticeProcessor(slot.conn.?, pq.discardNotice, null);
             slot.phase = .connecting;
             slot.poll_events = std.c.POLL.OUT;
             slot.deadline_ns = now + @as(i64, canary.config.timeout_ms) * std.time.ns_per_ms;
