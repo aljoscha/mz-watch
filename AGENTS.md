@@ -8,4 +8,5 @@ Run `zig fmt --check build.zig src` and `zig build test` before committing.
 Use `zig build -fincremental --watch` for iteration, launching the executable
 separately. Also verify ordinary builds, since incremental compilation is experimental.
 
-Do not commit connection credentials. No persisted configuration is required.
+Do not commit connection credentials. Persist configuration as private ZON files.
+Do not persist measurements or expose credential-bearing parser diagnostics.

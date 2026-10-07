@@ -9,7 +9,9 @@ import re
 import select
 import signal
 import struct
+import subprocess
 import sys
+import tempfile
 import termios
 import time
 from pathlib import Path
@@ -26,13 +28,15 @@ class Screen(pyte.Screen):
 
 
 class Terminal:
-    def __init__(self, executable):
+    def __init__(self, executable, config_home):
+        self.closed = False
         self.screen = Screen(120, 32)
         self.stream = pyte.Stream(self.screen)
         self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.environ["TERM"] = "xterm-256color"
+            os.environ["XDG_CONFIG_HOME"] = config_home
             # pyte understands semicolon SGR colors, not colon subparameters.
             os.environ["VAXIS_FORCE_LEGACY_SGR"] = "1"
             os.environ.pop("NO_COLOR", None)
@@ -92,12 +96,15 @@ class Terminal:
         raise AssertionError(f"Missing control: {label}")
 
     def close(self):
+        if self.closed:
+            return
         self.send("\x03")
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             pid, status = os.waitpid(self.pid, os.WNOHANG)
             if pid:
                 os.close(self.fd)
+                self.closed = True
                 if status != 0:
                     raise AssertionError(f"TUI exited with status {status}")
                 return
@@ -110,6 +117,7 @@ class Terminal:
         os.kill(self.pid, signal.SIGKILL)
         os.waitpid(self.pid, 0)
         os.close(self.fd)
+        self.closed = True
         raise AssertionError("TUI did not shut down within five seconds")
 
 
@@ -219,7 +227,8 @@ def main():
             "Set MZ_WATCH_SMOKE_CONNINFO to a disposable Materialize or PostgreSQL endpoint."
         )
     executable = Path(__file__).resolve().parent.parent / "zig-out/bin/mz-watch"
-    terminal = Terminal(executable)
+    config_directory = tempfile.TemporaryDirectory(prefix="mz-watch-terminal-")
+    terminal = Terminal(executable, config_directory.name)
     try:
         terminal.contains("+ Endpoint")
         check_palette(terminal, True, "light fallback: pale panels and readable text")
@@ -244,7 +253,7 @@ def main():
         terminal.contains("ADD CANARY")
         terminal.send("\r")
         terminal.contains("nonempty name")
-        terminal.send("latency\r")
+        terminal.send("latency\t\t\x01\x0b1500\t\x01\x0b7000\r")
         terminal.wait(
             lambda screen: bool(re.search(r"OK [1-9][0-9]*", screen)),
             "real successful SQL sample",
@@ -264,6 +273,43 @@ def main():
         )
         terminal.send("p")
         terminal.contains("[paused]")
+        saved_path = Path(config_directory.name) / "mz-watch/config.zon"
+        assert saved_path.stat().st_mode & 0o777 == 0o600, "private configuration"
+        saved = saved_path.read_bytes()
+        terminal.close()
+        terminal = Terminal(executable, config_directory.name)
+        terminal.contains("Canary: latency  [paused]")
+        terminal.contains("Every 1500ms  /  deadline 7000ms  /  1 endpoints")
+        terminal.contains("OK 0  FAIL 0")
+        assert saved_path.read_bytes() == saved, (
+            "startup does not rewrite configuration"
+        )
+        backup = saved_path.with_suffix(".backup")
+        saved_path.rename(backup)
+        saved_path.mkdir()
+        terminal.send("p")
+        terminal.contains("Configuration not saved:")
+        assert backup.read_bytes() == saved, "failed save preserves last good state"
+        saved_path.rmdir()
+        backup.rename(saved_path)
+        terminal.send("p")
+        terminal.contains("Canary paused")
+        terminal.wait(
+            lambda screen: "Configuration not saved:" not in screen,
+            "autosave recovers after filesystem error",
+        )
+        terminal.send("j")
+        terminal.contains("Canary: probe-1")
+        terminal.wait(
+            lambda screen: bool(re.search(r"OK [1-9][0-9]*", screen)),
+            "restored endpoint connects and restored canary runs",
+        )
+        terminal.send("jk2")
+        terminal.contains("Last result: success")
+        terminal.send("\x1b[C")
+        terminal.contains("SQLSTATE 22012")
+        terminal.send("\x1b[D1k")
+        terminal.contains("Canary: latency  [paused]")
         terminal.send("2")
         terminal.contains("primary")
         terminal.contains("skipped")
@@ -284,10 +330,31 @@ def main():
         terminal.resize(120, 32)
         terminal.send("1")
         terminal.contains("latency")
-    finally:
         terminal.close()
+        malformed = b'.{ .endpoints = .{ .{ .name = "primary", .conninfo = "password=do-not-leak" } }, .unknown = true }'
+        saved_path.write_bytes(malformed)
+        result = subprocess.run(
+            [str(executable)],
+            env=os.environ | {"XDG_CONFIG_HOME": config_directory.name},
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        assert result.returncode != 0, "invalid configuration fails startup"
+        assert b"Cannot load configuration" in result.stderr, "clear startup error"
+        assert b"do-not-leak" not in result.stdout + result.stderr, (
+            "credential-safe startup error"
+        )
+        assert saved_path.read_bytes() == malformed, (
+            "invalid configuration is untouched"
+        )
+    finally:
+        try:
+            terminal.close()
+        finally:
+            config_directory.cleanup()
     print(
-        "PASS: palettes, batched toolbar, all endpoint/canary outcomes, mouse/forms, live SQL and charts, resize, pause, confirmation, removal, shutdown"
+        "PASS: persistence/restart, palettes, batched toolbar, all endpoint/canary outcomes, mouse/forms, live SQL and charts, resize, pause, confirmation, removal, shutdown"
     )
 
 

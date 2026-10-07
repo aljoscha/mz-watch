@@ -36,7 +36,8 @@ hostaddr=127.0.0.1 port=6875 user=materialize dbname=materialize
 
 Use `sslmode=verify-full` with the appropriate CA for remote TLS endpoints.
 Prefer `.pgpass` or libpq service files to embedding passwords. Connection strings
-are held in memory, not displayed after creation or saved to disk.
+are saved verbatim in the private configuration file, but not displayed after
+creation. Embedded passwords are stored in plaintext.
 
 The Canaries and Endpoints tabs select the detail panel. `1` and `2` select those
 tabs, `j`/`k` or the arrow keys select an item, `p` pauses the selected canary,
@@ -52,8 +53,40 @@ At 80x24 both charts fit. Wider terminals also show both item lists.
 Smaller terminals keep controls and measurements accessible, hiding charts when
 there is not enough room.
 
-Configuration and measurements are session-local. There is no persistence,
-automatic endpoint discovery, failover policy, or process control.
+There is no automatic endpoint discovery, failover policy, or process control.
+
+## Configuration
+
+Endpoints and canaries load on startup. Adding, removing, pausing or resuming
+items automatically saves `~/.config/mz-watch/config.zon`, or
+`$XDG_CONFIG_HOME/mz-watch/config.zon` when that variable is an absolute path.
+Measurements reset each session. Files are atomically replaced with permissions
+`0600`. Missing directories are created with permissions `0700`.
+
+The format is ZON, supported by Zig's standard library. For example:
+
+```zig
+.{
+    .endpoints = .{
+        .{ .name = "local", .conninfo = "service=demo" },
+    },
+    .canaries = .{
+        .{
+            .name = "availability",
+            .sql = "SELECT 1",
+            .interval_ms = 1000,
+            .timeout_ms = 5000,
+            .paused = false,
+        },
+    },
+}
+```
+
+Edit the file while the dashboard is stopped. Use one dashboard per configuration
+file. Autosave rewrites the file, including comments. Invalid configuration stops
+startup without modifying the file or printing its contents. If saving fails,
+the dashboard shows an error and keeps your changes in memory. The previous
+saved file stays intact. A subsequent configuration change retries saving.
 
 ## Measurements
 
@@ -112,4 +145,5 @@ MZ_WATCH_SMOKE_CONNINFO='hostaddr=127.0.0.1 port=6875 user=materialize dbname=ma
 
 Use a disposable Materialize or PostgreSQL endpoint. The test exercises mouse
 buttons, forms, real SQL samples, both charts, every endpoint/canary pair, light
-and dark palettes, resize, pause and removal.
+and dark palettes, resize, pause, removal, persistence across restarts and save
+failure recovery. Its configuration is isolated in a temporary directory.

@@ -3,10 +3,11 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const runner_mod = @import("runner.zig");
 const metrics = @import("metrics.zig");
+const config = @import("config.zig");
 
 const Palette = @import("theme.zig").Palette;
 
-const Endpoint = struct { id: u64, name: []const u8 };
+const Endpoint = struct { id: u64, name: []const u8, conninfo: []const u8 };
 const Observation = struct {
     status: runner_mod.Status = .connecting,
     last_status: ?runner_mod.Status = null,
@@ -81,6 +82,8 @@ pub const Dashboard = struct {
     endpoint_index: usize = 0,
     next_id: u64 = 1,
     message: []const u8 = "",
+    config_path: ?[]const u8 = null,
+    save_error: ?anyerror = null,
 
     /// Initialize only after placement at a stable address.
     pub fn init(self: *Dashboard, allocator: std.mem.Allocator, runner: *runner_mod.Runner) void {
@@ -102,7 +105,10 @@ pub const Dashboard = struct {
 
     pub fn deinit(self: *Dashboard) void {
         for (&self.fields) |*field| field.deinit();
-        for (self.endpoints.items) |endpoint| self.allocator.free(endpoint.name);
+        for (self.endpoints.items) |endpoint| {
+            self.allocator.free(endpoint.name);
+            self.allocator.free(endpoint.conninfo);
+        }
         for (self.canaries.items) |*canary| self.freeCanary(canary);
         for (self.rows.items) |item| self.allocator.destroy(item);
         self.rows.deinit(self.allocator);
@@ -114,6 +120,67 @@ pub const Dashboard = struct {
         self.allocator.free(canary.name);
         self.allocator.free(canary.sql);
         canary.observations.deinit(self.allocator);
+    }
+
+    /// Load validated configuration once, before starting the runner.
+    /// Strings are copied. On failure, deinit still releases partial state.
+    pub fn loadConfiguration(self: *Dashboard, saved: config.Config) !void {
+        for (saved.endpoints) |endpoint| try self.addEndpoint(endpoint.name, endpoint.conninfo);
+        for (saved.canaries) |canary| try self.addCanary(canary);
+        self.endpoint_index = 0;
+        self.canary_index = 0;
+    }
+
+    fn addEndpoint(self: *Dashboard, name: []const u8, conninfo: []const u8) !void {
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        const owned_conninfo = try self.allocator.dupe(u8, conninfo);
+        errdefer self.allocator.free(owned_conninfo);
+        try self.endpoints.ensureUnusedCapacity(self.allocator, 1);
+        try self.runner.addEndpoint(self.next_id, conninfo);
+        self.endpoints.appendAssumeCapacity(.{ .id = self.next_id, .name = owned_name, .conninfo = owned_conninfo });
+        self.endpoint_index = self.endpoints.items.len - 1;
+        self.next_id += 1;
+    }
+
+    fn addCanary(self: *Dashboard, saved: config.Canary) !void {
+        {
+            const owned_name = try self.allocator.dupe(u8, saved.name);
+            errdefer self.allocator.free(owned_name);
+            const owned_sql = try self.allocator.dupe(u8, saved.sql);
+            errdefer self.allocator.free(owned_sql);
+            try self.canaries.ensureUnusedCapacity(self.allocator, 1);
+            try self.runner.addCanary(self.next_id, saved.sql, saved.interval_ms, saved.timeout_ms);
+            self.canaries.appendAssumeCapacity(.{ .id = self.next_id, .name = owned_name, .sql = owned_sql, .interval_ms = saved.interval_ms, .timeout_ms = saved.timeout_ms });
+        }
+        // Establish ownership before a fallible command. Startup can then clean
+        // up a partially loaded configuration without leaking its strings.
+        self.next_id += 1;
+        self.canary_index = self.canaries.items.len - 1;
+        if (saved.paused) {
+            try self.runner.pause(self.canaries.items[self.canary_index].id, true);
+            self.canaries.items[self.canary_index].paused = true;
+        }
+    }
+
+    fn persist(self: *Dashboard) void {
+        self.writeConfiguration() catch |err| {
+            self.save_error = err;
+            return;
+        };
+        self.save_error = null;
+    }
+
+    fn writeConfiguration(self: *Dashboard) !void {
+        const path = self.config_path orelse return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const endpoints = try a.alloc(config.Endpoint, self.endpoints.items.len);
+        for (endpoints, self.endpoints.items) |*saved, endpoint| saved.* = .{ .name = endpoint.name, .conninfo = endpoint.conninfo };
+        const canaries = try a.alloc(config.Canary, self.canaries.items.len);
+        for (canaries, self.canaries.items) |*saved, canary| saved.* = .{ .name = canary.name, .sql = canary.sql, .interval_ms = canary.interval_ms, .timeout_ms = canary.timeout_ms, .paused = canary.paused };
+        try config.save(a, self.runner.io, path, .{ .endpoints = endpoints, .canaries = canaries });
     }
 
     pub fn widget(self: *Dashboard) vxfw.Widget {
@@ -334,6 +401,7 @@ pub const Dashboard = struct {
                 try self.runner.pause(canary.id, !canary.paused);
                 canary.paused = !canary.paused;
                 self.message = if (canary.paused) "Canary paused" else "Canary resumed";
+                self.persist();
             },
             .remove => {
                 if (self.page == .canaries and self.selectedCanary() != null) self.form = .remove_canary;
@@ -360,6 +428,7 @@ pub const Dashboard = struct {
                 const endpoint = self.endpoints.items[self.endpoint_index];
                 try self.runner.removeEndpoint(endpoint.id);
                 self.allocator.free(endpoint.name);
+                self.allocator.free(endpoint.conninfo);
                 _ = self.endpoints.orderedRemove(self.endpoint_index);
                 for (self.canaries.items) |*canary| {
                     _ = canary.observations.remove(endpoint.id);
@@ -373,20 +442,16 @@ pub const Dashboard = struct {
             for (values[0..count], 0..) |*value, i| value.* = try self.fields[i].buf.dupe();
             const name = std.mem.trim(u8, values[0], " \t\r\n");
             const query = std.mem.trim(u8, values[1], " \t\r\n");
-            const invalid_name = for (name) |byte| {
-                if (byte < 32 or byte == 127) break true;
-            } else false;
-            if (name.len == 0 or query.len == 0 or invalid_name or std.mem.indexOfScalar(u8, query, 0) != null) {
-                self.message = "Use a nonempty name without control characters, and a connection/query without NUL bytes.";
+            const candidate: config.Config = if (self.form == .endpoint)
+                .{ .endpoints = &.{.{ .name = name, .conninfo = query }} }
+            else
+                .{ .canaries = &.{.{ .name = name, .sql = query }} };
+            config.validate(candidate) catch {
+                self.message = "Use a nonempty name without control characters, and a nonempty UTF-8 connection/query without NUL bytes.";
                 return ctx.consumeAndRedraw();
-            }
+            };
             if (self.form == .endpoint) {
-                const owned = try self.allocator.dupe(u8, name);
-                errdefer self.allocator.free(owned);
-                try self.endpoints.ensureUnusedCapacity(self.allocator, 1);
-                try self.runner.addEndpoint(self.next_id, query);
-                self.endpoints.appendAssumeCapacity(.{ .id = self.next_id, .name = owned });
-                self.endpoint_index = self.endpoints.items.len - 1;
+                try self.addEndpoint(name, query);
             } else {
                 const interval = std.fmt.parseInt(u32, std.mem.trim(u8, values[2], " \t"), 10) catch 0;
                 const timeout = std.fmt.parseInt(u32, std.mem.trim(u8, values[3], " \t"), 10) catch 0;
@@ -394,18 +459,11 @@ pub const Dashboard = struct {
                     self.message = "Interval and timeout must be positive milliseconds.";
                     return ctx.consumeAndRedraw();
                 }
-                const owned_name = try self.allocator.dupe(u8, name);
-                errdefer self.allocator.free(owned_name);
-                const owned_sql = try self.allocator.dupe(u8, query);
-                errdefer self.allocator.free(owned_sql);
-                try self.canaries.ensureUnusedCapacity(self.allocator, 1);
-                try self.runner.addCanary(self.next_id, query, interval, timeout);
-                self.canaries.appendAssumeCapacity(.{ .id = self.next_id, .name = owned_name, .sql = owned_sql, .interval_ms = interval, .timeout_ms = timeout });
-                self.canary_index = self.canaries.items.len - 1;
+                try self.addCanary(.{ .name = name, .sql = query, .interval_ms = interval, .timeout_ms = timeout });
                 self.page = .canaries;
             }
-            self.next_id += 1;
         }
+        self.persist();
         self.form = .none;
         self.toolbar_focus = null;
         self.resetFields();
@@ -576,7 +634,8 @@ pub const Dashboard = struct {
                 } else text(surface, ctx, 1, top, w - 2, if (self.page == .canaries) "No canaries" else "No endpoints", self.colors.muted);
                 if (self.page == .canaries) try self.details(surface, ctx, 1, top + 2, w - 2, bottom -| (top + 2)) else try self.endpointDetails(surface, &children, ctx, 1, top + 2, w - 2, bottom -| (top + 2));
             }
-            text(surface, ctx, 1, h - 2, w - 2, self.message, if (self.runner.failed.load(.acquire)) self.colors.danger else self.colors.muted);
+            const message = if (self.save_error) |err| try std.fmt.allocPrint(ctx.arena, "Configuration not saved: {t}. Changes are session-only.", .{err}) else self.message;
+            text(surface, ctx, 1, h - 2, w - 2, message, if (self.save_error != null or self.runner.failed.load(.acquire)) self.colors.danger else self.colors.muted);
             text(surface, ctx, 1, h - 1, w - 2, "1/2 panels  j/k select  a/e add  p pause  x remove  Tab focus  q quit", self.colors.muted);
         }
         surface.children = children.items;

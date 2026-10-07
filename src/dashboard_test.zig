@@ -3,18 +3,38 @@ const vxfw = @import("vaxis").vxfw;
 const Dashboard = @import("dashboard.zig").Dashboard;
 const api = @import("runner.zig");
 
+fn configurationLoad(allocator: std.mem.Allocator) !void {
+    var runner = api.Runner.init(allocator, std.testing.io);
+    defer runner.deinit();
+    const model = try allocator.create(Dashboard);
+    defer allocator.destroy(model);
+    model.init(allocator, &runner);
+    defer model.deinit();
+    try model.loadConfiguration(.{
+        .endpoints = &.{.{ .name = "primary", .conninfo = "service=demo" }},
+        .canaries = &.{
+            .{ .name = "one", .sql = "SELECT 1", .paused = true },
+            .{ .name = "two", .sql = "SELECT 2", .paused = true },
+            .{ .name = "three", .sql = "SELECT 3", .paused = true },
+            .{ .name = "four", .sql = "SELECT 4", .paused = true },
+            .{ .name = "five", .sql = "SELECT 5", .paused = true },
+        },
+    });
+}
+
+test "configuration loading releases partial ownership on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, configurationLoad, .{});
+}
+
 fn fixture(allocator: std.mem.Allocator, runner: *api.Runner) !*Dashboard {
     const model = try allocator.create(Dashboard);
     errdefer allocator.destroy(model);
     model.init(allocator, runner);
     errdefer model.deinit();
-    try model.endpoints.ensureUnusedCapacity(allocator, 1);
-    model.endpoints.appendAssumeCapacity(.{ .id = 1, .name = try allocator.dupe(u8, "primary") });
-    try model.canaries.ensureUnusedCapacity(allocator, 1);
-    const name = try allocator.dupe(u8, "latency");
-    errdefer allocator.free(name);
-    const sql = try allocator.dupe(u8, "SELECT 1");
-    model.canaries.appendAssumeCapacity(.{ .id = 2, .name = name, .sql = sql, .interval_ms = 1000, .timeout_ms = 5000 });
+    try model.loadConfiguration(.{
+        .endpoints = &.{.{ .name = "primary", .conninfo = "service=demo" }},
+        .canaries = &.{.{ .name = "latency", .sql = "SELECT 1" }},
+    });
     return model;
 }
 

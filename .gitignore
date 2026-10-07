@@ -5,3 +5,4 @@ zig-pkg/
 __pycache__/
 .env
 *.core
+config.zon
