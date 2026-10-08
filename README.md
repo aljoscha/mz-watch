@@ -40,7 +40,8 @@ are saved verbatim in the private configuration file. Endpoint details show
 normalized explicit connection options with password fields redacted.
 Embedded passwords are stored in plaintext on disk.
 
-The Canaries and Endpoints tabs select the detail panel. `1` and `2` select those
+The Canaries tab shows queries and winner-latency charts. The Endpoints tab
+compares destinations for one canary. `1` and `2` select those
 tabs, `j`/`k` or the arrow keys select an item, `p` pauses the selected canary,
 and `x` opens removal confirmation. Tab moves focus between controls, Enter
 activates them, and Escape cancels a form. Quit with `q` or Ctrl-C.
@@ -49,21 +50,25 @@ Removal defaults to Confirm, so Enter removes the item. Escape or Cancel closes
 the dialog without changing it. The background cannot be clicked while a dialog
 is open.
 In the Endpoints tab, use `h`/`l` or the previous/next canary buttons to
-inspect each endpoint/canary pair. Current activity and the last completed
+choose the canary in the fixed header. All endpoint cards show results for that
+same query, and scroll together below it. Current activity and the last completed
 result are shown separately, so a retry does not erase the last diagnostic.
 Left/right arrows remain aliases for `h`/`l`.
 
-Each tab shows a multi-row list. `j`/`k` select items and keep the selection in
+Each tab shows a selectable list, with full-width result cards for endpoints.
+`j`/`k` select items and keep the selection in
 view. Mouse-wheel scrolling browses the list without changing the selected
 item. Labels are left-aligned, with status summaries and faint separators.
-Click a row to select it, or click and drag the scrollbar to browse.
+Click a row or endpoint card to select it, or click and drag the scrollbar to
+browse. Removal targets the selected item, not the first visible item.
 The two tabs retain their own scroll positions within the session.
 
 Light mode is the default, with pale backgrounds, bordered panels and teal
 accents. A terminal color-scheme report switches the palette automatically.
 The active tab is white in light mode, with a teal inactive tab. Keyboard focus
 is underlined rather than changing which tab looks active. At 80x24 both charts
-fit below the list. Wider terminals put the active list beside the details.
+fit below the canary list. Wider terminals put the canary list beside its charts.
+The Endpoints tab shows multiple cards at both 80x24 and wider sizes.
 Smaller terminals keep controls and measurements accessible, hiding charts when
 there is not enough room.
 

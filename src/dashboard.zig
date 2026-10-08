@@ -50,6 +50,20 @@ const ListArea = struct {
 const Viewport = struct {
     start: usize = 0,
     ensure_selection: bool = true,
+    capacity: usize = 0,
+
+    fn fit(self: *Viewport, selection: usize, count: usize, capacity: usize) void {
+        if (self.capacity != capacity) self.ensure_selection = true;
+        self.capacity = capacity;
+        self.start = @min(self.start, count -| capacity);
+        // Keyboard selection follows the cursor. Wheel browsing leaves the
+        // selection unchanged until a selection change or resize.
+        if (self.ensure_selection) {
+            if (selection < self.start) self.start = selection;
+            if (selection >= self.start + capacity) self.start = selection - capacity + 1;
+            self.ensure_selection = false;
+        }
+    }
 };
 const Control = struct {
     owner: *Dashboard,
@@ -90,6 +104,31 @@ const Row = struct {
         const width: usize = surface.size.width;
         const height: usize = surface.size.height;
         if (width == 0 or height == 0) return surface;
+        if (self.page == .endpoints) {
+            const endpoint_index = self.owner.endpointIndex(self.id) orelse return surface;
+            const endpoint = self.owner.endpoints.items[endpoint_index];
+            var muted = self.owner.colors.muted;
+            muted.bg = style.bg;
+            text(surface, ctx, 0, 0, width, button.label, style);
+            text(surface, ctx, 2, 1, width -| 2, endpoint.label, muted);
+            if (self.owner.selectedCanary()) |canary| {
+                const value: Observation = canary.observations.get(endpoint.id) orelse .{};
+                var current_style = statusStyle(self.owner.colors, value.status);
+                current_style.bg = style.bg;
+                text(surface, ctx, 2, 2, width -| 2, try std.fmt.allocPrint(ctx.arena, "Current: {s}", .{@tagName(value.status)}), current_style);
+                const last = if (value.last_status) |status| @tagName(status) else "none";
+                var last_style = if (value.last_status) |status| statusStyle(self.owner.colors, status) else muted;
+                last_style.bg = style.bg;
+                const sqlstate = std.mem.trim(u8, &value.sqlstate, " ");
+                text(surface, ctx, 2, 3, width -| 2, try std.fmt.allocPrint(ctx.arena, "Last result: {s}{s}{s}", .{ last, if (sqlstate.len > 0) "  SQLSTATE " else "", sqlstate }), last_style);
+                const latency = if (value.latency) |n| try std.fmt.allocPrint(ctx.arena, "{d:.2}ms", .{n}) else "-";
+                text(surface, ctx, 2, 4, width -| 2, try std.fmt.allocPrint(ctx.arena, "Last result latency: {s}  ok {d}  errors {d}  skipped {d}  wins {d}", .{ latency, value.successes, value.errors, value.skipped, value.wins }), muted);
+            } else text(surface, ctx, 2, 2, width -| 2, "No canaries", muted);
+            var separator = self.owner.colors.border;
+            separator.bg = style.bg;
+            for (0..width) |col| text(surface, ctx, col, height - 1, 1, "─", separator);
+            return surface;
+        }
         const compact = height == 1;
         const label_width = if (compact and self.summary.len > 0) width / 2 else width;
         text(surface, ctx, 0, 0, label_width, button.label, style);
@@ -358,7 +397,7 @@ pub const Dashboard = struct {
                 return ctx.consumeEvent();
             }
         } else if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
-            const count: usize = if (self.page == .endpoints and self.canaries.items.len > 0 and self.endpoints.items.len > 0) toolbar_actions.len else 7;
+            const count: usize = if (self.page == .endpoints and self.canaries.items.len > 0) toolbar_actions.len else 7;
             const index = for (toolbar_actions[0..count], 0..) |action, i| {
                 if (self.toolbar_focus == action) break i;
             } else if (key.mods.shift) @as(usize, 0) else count - 1;
@@ -626,46 +665,33 @@ pub const Dashboard = struct {
         return false;
     }
 
-    fn list(self: *Dashboard, surface: vxfw.Surface, children: *std.ArrayList(vxfw.SubSurface), ctx: vxfw.DrawContext, x: usize, y: usize, width: usize, height: usize) !void {
+    fn canaryList(self: *Dashboard, surface: vxfw.Surface, children: *std.ArrayList(vxfw.SubSurface), ctx: vxfw.DrawContext, x: usize, y: usize, width: usize, height: usize) !void {
         if (width < 2 or height == 0) return;
         const row_height: usize = if (surface.size.width >= 112) 3 else 1;
         const capacity = height / row_height;
         if (capacity == 0) return;
-        if (self.list_area.height != height or self.list_area.row_height != row_height) self.viewports[@backingInt(self.page)].ensure_selection = true;
         self.list_area = .{ .x = x, .y = y, .width = width, .height = height, .row_height = row_height };
-        const page = self.page;
-        const len = if (page == .canaries) self.canaries.items.len else self.endpoints.items.len;
-        const title = if (page == .canaries) "CANARIES" else "ENDPOINTS";
+        const page = Page.canaries;
+        const len = self.canaries.items.len;
+        const title = "CANARIES";
         if (len == 0) {
             text(surface, ctx, x, y -| 1, width, title, self.colors.accent);
-            text(surface, ctx, x, y, width, if (page == .canaries) "No canaries" else "No endpoints", self.colors.muted);
+            text(surface, ctx, x, y, width, "No canaries", self.colors.muted);
             return;
         }
-        const index = if (page == .canaries) &self.canary_index else &self.endpoint_index;
+        const index = &self.canary_index;
         index.* = @min(index.*, len - 1);
         const viewport = &self.viewports[@backingInt(page)];
-        viewport.start = @min(viewport.start, len -| capacity);
-        // Keyboard selection follows the cursor. Wheel browsing deliberately
-        // leaves the selection and its detail panel unchanged.
-        if (viewport.ensure_selection) {
-            if (index.* < viewport.start) viewport.start = index.*;
-            if (index.* >= viewport.start + capacity) viewport.start = index.* - capacity + 1;
-            viewport.ensure_selection = false;
-        }
+        viewport.fit(index.*, len, capacity);
         text(surface, ctx, x, y -| 1, width, try std.fmt.allocPrint(ctx.arena, "{s} {d}/{d}  [j/k]", .{ title, index.* + 1, len }), self.colors.accent);
         const overflow = len > capacity;
         const row_width = width - @as(usize, if (overflow) 2 else 0);
         for (viewport.start..@min(len, viewport.start + capacity)) |i| {
-            const id = if (page == .canaries) self.canaries.items[i].id else self.endpoints.items[i].id;
-            const name = if (page == .canaries) self.canaries.items[i].name else self.endpoints.items[i].name;
+            const canary = self.canaries.items[i];
+            const id = canary.id;
+            const name = canary.name;
             const label = try std.fmt.allocPrint(ctx.arena, "{s} {s}", .{ if (i == index.*) ">" else " ", name });
-            const summary = if (page == .canaries) blk: {
-                const canary = self.canaries.items[i];
-                break :blk try std.fmt.allocPrint(ctx.arena, "{s} ok {d} / fail {d}", .{ if (canary.paused) "paused" else "live", canary.stats.successes, canary.stats.failures });
-            } else if (self.selectedCanary()) |canary| blk: {
-                const observation: Observation = canary.observations.get(id) orelse .{};
-                break :blk try std.fmt.allocPrint(ctx.arena, "{s} wins {d}", .{ @tagName(observation.status), observation.wins });
-            } else "";
+            const summary = try std.fmt.allocPrint(ctx.arena, "{s} ok {d} / fail {d}", .{ if (canary.paused) "paused" else "live", canary.stats.successes, canary.stats.failures });
             const item = try self.row(i - viewport.start, page, id, label, summary, i == index.*);
             try child(children, ctx, item.widget(), x, y + (i - viewport.start) * row_height, row_width, row_height);
         }
@@ -706,28 +732,47 @@ pub const Dashboard = struct {
         }
     }
 
-    fn endpointDetails(self: *Dashboard, full_surface: vxfw.Surface, children: *std.ArrayList(vxfw.SubSurface), full_ctx: vxfw.DrawContext, x: usize, y: usize, width: usize, height: usize) !void {
-        const surface = full_surface.trimHeight(@intCast(@min(full_surface.size.height, y + height)));
-        const ctx = full_ctx.withConstraints(.{ .width = 0, .height = 0 }, vxfw.MaxSize.fromSize(surface.size));
-        if (self.endpoints.items.len == 0) return;
-        self.endpoint_index = @min(self.endpoint_index, self.endpoints.items.len - 1);
-        const endpoint = self.endpoints.items[self.endpoint_index];
-        text(surface, ctx, x, y, width, try std.fmt.allocPrint(ctx.arena, "Endpoint: {s}", .{endpoint.name}), self.colors.accent);
-        text(surface, ctx, x, y + 1, width, endpoint.label, self.colors.muted);
-        const canary = self.selectedCanary() orelse {
-            text(surface, ctx, x, y + 2, width, "No canaries", self.colors.muted);
+    fn endpointComparison(self: *Dashboard, surface: vxfw.Surface, children: *std.ArrayList(vxfw.SubSurface), ctx: vxfw.DrawContext, top: usize, bottom: usize) !void {
+        const width: usize = surface.size.width;
+        text(surface, ctx, 2, top - 1, width - 4, if (self.endpoints.items.len == 0) "ENDPOINTS" else try std.fmt.allocPrint(ctx.arena, "ENDPOINTS {d}/{d}  [j/k]", .{ @min(self.endpoint_index + 1, self.endpoints.items.len), self.endpoints.items.len }), self.colors.accent);
+        const canary = self.selectedCanary();
+        const header_width = width -| 29;
+        text(surface, ctx, 1, top, header_width, if (canary) |value| try std.fmt.allocPrint(ctx.arena, "Canary {d}/{d}: {s}  [h/l]", .{ self.canary_index + 1, self.canaries.items.len, value.name }) else "No canaries", self.colors.accent);
+        if (canary) |value| {
+            try child(children, ctx, self.controls[9].button.widget(), width - 26, top, 11, 1);
+            try child(children, ctx, self.controls[10].button.widget(), width - 13, top, 11, 1);
+            text(surface, ctx, 1, top + 1, width - 2, value.sql, self.colors.muted);
+        }
+        const y = top + 3;
+        const row_height: usize = 6;
+        const height = bottom -| y;
+        const capacity = height / row_height;
+        self.list_area = .{ .x = 1, .y = y, .width = width - 2, .height = height, .row_height = row_height };
+        if (self.endpoints.items.len == 0) {
+            text(surface, ctx, 1, y, width - 2, "No endpoints", self.colors.muted);
             return;
-        };
-        try child(children, ctx, self.controls[9].button.widget(), x, y + 2, 11, 1);
-        try child(children, ctx, self.controls[10].button.widget(), x + 13, y + 2, 11, 1);
-        text(surface, ctx, x, y + 4, width, try std.fmt.allocPrint(ctx.arena, "Canary {d}/{d}: {s}  [h/l]", .{ self.canary_index + 1, self.canaries.items.len, canary.name }), self.colors.accent);
-        const value: Observation = canary.observations.get(endpoint.id) orelse .{};
-        text(surface, ctx, x, y + 6, width, try std.fmt.allocPrint(ctx.arena, "Current: {s}", .{@tagName(value.status)}), statusStyle(self.colors, value.status));
-        const last = if (value.last_status) |status| @tagName(status) else "none";
-        text(surface, ctx, x, y + 7, width, try std.fmt.allocPrint(ctx.arena, "Last result: {s}  SQLSTATE {s}", .{ last, value.sqlstate }), if (value.last_status) |status| statusStyle(self.colors, status) else self.colors.muted);
-        text(surface, ctx, x, y + 9, width, try std.fmt.allocPrint(ctx.arena, "ok {d}  errors {d}  skipped {d}  wins {d}", .{ value.successes, value.errors, value.skipped, value.wins }), self.colors.base);
-        const latency = if (value.latency) |n| try std.fmt.allocPrint(ctx.arena, "{d:.2}ms", .{n}) else "-";
-        text(surface, ctx, x, y + 10, width, try std.fmt.allocPrint(ctx.arena, "Last result latency: {s}", .{latency}), self.colors.muted);
+        }
+        if (capacity == 0) {
+            text(surface, ctx, 1, y, width - 2, "Enlarge the terminal for endpoint results.", self.colors.muted);
+            self.list_area = .{};
+            return;
+        }
+        self.endpoint_index = @min(self.endpoint_index, self.endpoints.items.len - 1);
+        const viewport = &self.viewports[@backingInt(Page.endpoints)];
+        viewport.fit(self.endpoint_index, self.endpoints.items.len, capacity);
+        const overflow = self.endpoints.items.len > capacity;
+        const card_width = width - 2 - @as(usize, if (overflow) 2 else 0);
+        for (viewport.start..@min(self.endpoints.items.len, viewport.start + capacity)) |i| {
+            const endpoint = self.endpoints.items[i];
+            const label = try std.fmt.allocPrint(ctx.arena, "{s} Endpoint: {s}", .{ if (i == self.endpoint_index) ">" else " ", endpoint.name });
+            const item = try self.row(i - viewport.start, .endpoints, endpoint.id, label, "", i == self.endpoint_index);
+            try child(children, ctx, item.widget(), 1, y + (i - viewport.start) * row_height, card_width, row_height);
+        }
+        if (overflow) {
+            const thumb = @max(@as(usize, 1), height * capacity / self.endpoints.items.len);
+            const thumb_top = viewport.start * (height - thumb) / (self.endpoints.items.len - capacity);
+            for (0..height) |row_y| text(surface, ctx, width - 2, y + row_y, 1, if (row_y >= thumb_top and row_y < thumb_top + thumb) "┃" else "│", if (row_y >= thumb_top and row_y < thumb_top + thumb) self.colors.accent else self.colors.border);
+        }
     }
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
@@ -774,20 +819,23 @@ pub const Dashboard = struct {
             try child(&children, ctx, self.controls[5].button.widget(), 15, y + 2, 13, 1);
             const top = y + 4;
             const bottom = h - 3;
-            if (w >= 112) {
+            if (self.page == .endpoints) {
+                box(surface, ctx, self.colors, 0, top - 1, w, bottom -| top + 2);
+                try self.endpointComparison(surface, &children, ctx, top, bottom);
+            } else if (w >= 112) {
                 const sidebar: usize = 30;
                 box(surface, ctx, self.colors, 0, top - 1, sidebar + 2, bottom -| top + 2);
                 box(surface, ctx, self.colors, 33, top - 1, w - 34, bottom -| top + 2);
-                try self.list(surface, &children, ctx, 2, top, sidebar - 2, bottom -| top);
-                if (self.page == .canaries) try self.details(surface, ctx, 35, top, w - 37, bottom -| top) else try self.endpointDetails(surface, &children, ctx, 35, top, w - 37, bottom -| top);
+                try self.canaryList(surface, &children, ctx, 2, top, sidebar - 2, bottom -| top);
+                try self.details(surface, ctx, 35, top, w - 37, bottom -| top);
             } else {
                 const available = bottom -| top;
                 const list_height: usize = @min(available -| 2, @min(@as(usize, 6), @max(@as(usize, 2), available -| 13)));
                 box(surface, ctx, self.colors, 0, top - 1, w, list_height + 2);
-                try self.list(surface, &children, ctx, 1, top, w - 2, list_height);
+                try self.canaryList(surface, &children, ctx, 1, top, w - 2, list_height);
                 const detail_top = top + list_height + 2;
                 box(surface, ctx, self.colors, 0, detail_top - 1, w, bottom -| detail_top + 2);
-                if (self.page == .canaries) try self.details(surface, ctx, 1, detail_top, w - 2, bottom -| detail_top) else try self.endpointDetails(surface, &children, ctx, 1, detail_top, w - 2, bottom -| detail_top);
+                try self.details(surface, ctx, 1, detail_top, w - 2, bottom -| detail_top);
             }
             const message = if (self.save_error) |err| try std.fmt.allocPrint(ctx.arena, "Configuration not saved: {t}. Changes are session-only.", .{err}) else self.message;
             text(surface, ctx, 1, h - 2, w - 2, message, if (self.save_error != null or self.runner.failed.load(.acquire)) self.colors.danger else self.colors.muted);

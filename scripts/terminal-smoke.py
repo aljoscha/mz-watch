@@ -192,12 +192,67 @@ def check_overlay(terminal, title):
     terminal.contains(title)
 
 
+def endpoint_cards(screen):
+    """Return complete six-line cards keyed by their endpoint name."""
+    lines = screen.splitlines()
+    cards = {}
+    for row, line in enumerate(lines):
+        match = re.match(r"[ │]*(?:> )?Endpoint: (\S+)", line)
+        if match:
+            name = match[1]
+            assert name not in cards, "endpoint rendered once, without a detail title"
+            cards[name] = lines[row : row + 6]
+    return cards
+
+
+def endpoint_header(screen, index, total, name, sql):
+    lines = screen.splitlines()
+    return (
+        len(re.findall(r"Canary \d+/\d+:", screen)) == 1
+        and len(re.findall(r"\[h/l\]", screen)) == 1
+        and lines[6]
+        .lstrip(" │")
+        .startswith(f"Canary {index + 1}/{total}: {name}  [h/l]")
+        and lines[7].strip(" │") == sql
+        and "Canary:" not in screen
+        and screen.count("< Canary") == 1
+        and screen.count("Canary >") == 1
+    )
+
+
+def endpoint_outcome(terminal, endpoint, status):
+    def visible(screen):
+        card = endpoint_cards(screen).get(endpoint)
+        if card is None or len(card) != 6:
+            return False
+        counts = (
+            r"ok [1-9][0-9]*  errors \d+  skipped \d+  wins \d+"
+            if status == "success"
+            else r"ok \d+  errors [1-9][0-9]*  skipped \d+  wins \d+"
+        )
+        return (
+            card[2].strip(" │┃") == f"Current: {status}"
+            and f"Last result: {status}" in card[3]
+            and (status != "query_error" or "SQLSTATE 22012" in card[3])
+            and "Last result latency:" in card[4]
+            and bool(re.search(counts, card[4]))
+        )
+
+    terminal.wait(visible, f"{endpoint}: card-scoped {status} outcome and stats")
+
+
 def check_endpoint_navigation(terminal, conninfo):
     terminal.send("e")
     terminal.contains("ADD ENDPOINT")
     terminal.send("secondary\t" + conninfo + "\r")
     terminal.contains("+ Canary")
-    canaries = [("latency", "success")]
+    # Read the default SQL in full from the Canaries detail, not a guessed label.
+    lines = terminal.screen.display
+    detail_row = next(i for i, line in enumerate(lines) if "Canary: latency" in line)
+    detail_col = lines[detail_row].index("Canary: latency")
+    latency_sql = lines[detail_row + 1][detail_col:].strip(" │")
+    assert latency_sql.startswith("SELECT"), "default canary SQL is visible"
+    canaries = [("latency", "success", latency_sql)]
     for index in range(6):
         name = f"probe-{index + 1}"
         failing = index % 2 == 1
@@ -208,34 +263,29 @@ def check_endpoint_navigation(terminal, conninfo):
             name + "\t\x01\x0b" + ("SELECT 1 / 0" if failing else "SELECT 1") + "\r"
         )
         terminal.contains(f"Canary: {name}")
-        canaries.append((name, "query_error" if failing else "success"))
+        canaries.append(
+            (
+                name,
+                "query_error" if failing else "success",
+                "SELECT 1 / 0" if failing else "SELECT 1",
+            )
+        )
+
+    live_endpoints = ("primary", "secondary")
 
     def outcome(index, endpoint):
-        name, status = canaries[index]
-        label = f"Canary {index + 1}/{len(canaries)}: {name}"
-
-        def visible(screen):
-            return (
-                f"Endpoint: {endpoint}" in screen
-                and label in screen
-                and len(re.findall(r"Canary \d+/\d+:", screen)) == 1
-                and f"Current: {status}" in screen
-                and f"Last result: {status}  SQLSTATE" in screen
-                and (status != "query_error" or "SQLSTATE 22012" in screen)
-                and bool(
-                    re.search(
-                        (
-                            r"ok [1-9][0-9]*  errors \d+  skipped \d+  wins \d+"
-                            if status == "success"
-                            else r"ok \d+  errors [1-9][0-9]*  skipped \d+  wins \d+"
-                        ),
-                        screen,
-                    )
-                )
-                and "Last result latency:" in screen
-            )
-
-        terminal.wait(visible, f"{endpoint} / {name}: selected outcome and stats")
+        name, status, sql = canaries[index]
+        terminal.wait(
+            lambda screen: endpoint_header(screen, index, len(canaries), name, sql),
+            f"{name}: single sticky header and full SQL",
+        )
+        terminal.contains(f"> Endpoint: {endpoint}")
+        terminal.wait(
+            lambda screen: set(endpoint_cards(screen)) == set(live_endpoints),
+            "all live endpoints have separate visible cards",
+        )
+        for visible_endpoint in live_endpoints:
+            endpoint_outcome(terminal, visible_endpoint, status)
 
     terminal.send("2k")
     outcome(len(canaries) - 1, "primary")
@@ -265,24 +315,32 @@ def check_endpoint_navigation(terminal, conninfo):
     terminal.send("x")
     terminal.contains("Remove selected item?")
     terminal.send("\r")
+    live_endpoints = ("primary",)
     outcome(0, "primary")
     terminal.send("1")
     terminal.contains("Canary: latency")
 
 
 def list_rows(terminal, prefix):
-    """Read item hit targets, excluding the independently selected detail title."""
+    """Read card/list hit targets, excluding the Canaries detail title."""
     rows = []
     for row, line in enumerate(terminal.screen.display):
-        if "Canary:" in line or "Endpoint:" in line or re.search(r"Canary \d+/", line):
+        if prefix == "target":
+            if not re.match(r"[ │]*(?:> )?Endpoint: target-\d{2}\b", line):
+                continue
+        elif "Canary:" in line or re.search(r"Canary \d+/", line):
             # Wide layouts put the list and detail title on the same line.
-            line = re.split(r"Canary:|Endpoint:|Canary \d+/", line)[0]
+            line = re.split(r"Canary:|Canary \d+/", line)[0]
         matches = list(re.finditer(rf"\b{prefix}-(\d{{2}})\b", line))
         assert len(matches) <= 1, "one item per list row"
         if matches:
             match = matches[0]
             rows.append((int(match[1]), match.start() + 1, row + 1))
     return rows
+
+
+def row_stride(terminal, prefix):
+    return 6 if prefix == "target" else (3 if terminal.screen.columns >= 112 else 1)
 
 
 def viewport(terminal, prefix, first=None, count=None):
@@ -293,7 +351,7 @@ def viewport(terminal, prefix, first=None, count=None):
             len(rows) >= 2
             and indices == list(range(indices[0], indices[0] + len(rows)))
             and all(
-                b[2] == a[2] + (3 if terminal.screen.columns >= 112 else 1)
+                b[2] == a[2] + row_stride(terminal, prefix)
                 for a, b in itertools.pairwise(rows)
             )
             and (first is None or indices[0] == first)
@@ -304,11 +362,14 @@ def viewport(terminal, prefix, first=None, count=None):
     return list_rows(terminal, prefix)
 
 
-def scrollbar(terminal, rows, total):
+def scrollbar(terminal, rows, total, prefix):
     # Locate the visible track beside the list, not a panel border or chart.
     # The thumb and track must be distinguishable in the rendered terminal.
     top = rows[0][2]
-    bottom = rows[-1][2] + (3 if terminal.screen.columns >= 112 else 1) - 1
+    bottom = rows[-1][2] + row_stride(terminal, prefix) - 1
+    if prefix == "target":
+        # The viewport includes any space too short for a complete card.
+        bottom = terminal.screen.lines - 3
     for col in range(rows[0][1] + 9, terminal.screen.columns):
         cells = [terminal.screen.buffer[row - 1][col] for row in range(top, bottom + 1)]
         glyphs = [cell.data for cell in cells]
@@ -361,7 +422,7 @@ def check_list_navigation(executable, endpoints=False):
     total = 48
     prefix = "target" if endpoints else "check"
     page = "2" if endpoints else "1"
-    detail = "Endpoint:" if endpoints else "Canary:"
+    detail = "> Endpoint:" if endpoints else "Canary:"
     active = "Endpoints" if endpoints else "Canaries"
     inactive = "Canaries" if endpoints else "Endpoints"
     with tempfile.TemporaryDirectory(prefix="mz-watch-lists-") as home:
@@ -370,11 +431,11 @@ def check_list_navigation(executable, endpoints=False):
         # No canary/endpoint cross product. Paused canaries never query the
         # numeric loopback endpoint, whose low port is not a database service.
         eps = ",".join(
-            f'.{{ .name = "target-{i:02}", .conninfo = "host=127.0.0.1 port=1 connect_timeout=1" }}'
+            f'.{{ .name = "target-{i:02}", .conninfo = "host=127.0.0.1 port=1 connect_timeout=1 password=smoke-secret" }}'
             for i in range(total if endpoints else 0)
         )
         canaries = ",".join(
-            f'.{{ .name = "check-{i:02}", .sql = "SELECT 1", .paused = true }}'
+            f'.{{ .name = "check-{i:02}", .sql = "SELECT {i + 1 if endpoints else 1}", .paused = true }}'
             for i in range(2 if endpoints else total)
         )
         with os.fdopen(
@@ -382,29 +443,82 @@ def check_list_navigation(executable, endpoints=False):
         ) as config:
             config.write(f".{{ .endpoints = .{{{eps}}}, .canaries = .{{{canaries}}} }}")
         terminal = Terminal(executable, home)
+        canary_index = 0
+
+        def header():
+            if endpoints:
+                terminal.wait(
+                    lambda screen: endpoint_header(
+                        screen,
+                        canary_index,
+                        2,
+                        f"check-{canary_index:02}",
+                        f"SELECT {canary_index + 1}",
+                    ),
+                    "one retained canary header with full SQL",
+                )
+
+        def browsed():
+            if endpoints:
+                header()
+                assert "> Endpoint:" not in "\n".join(terminal.screen.display), (
+                    "wheel/track browsing leaves offscreen selection unchanged"
+                )
+            else:
+                terminal.contains(f"{detail} {prefix}-00")
+
         try:
             terminal.contains("+ Endpoint")
             terminal.send(page)
             terminal.contains(f"{detail} {prefix}-00")
             terminal.settle()
-            rows = viewport(terminal, prefix, first=0)
-            assert len(rows) >= 7, (
-                "wide active list uses available height for labels and summaries"
-            )
+            rows = viewport(terminal, prefix, first=0, count=3 if endpoints else None)
+            header()
+            if endpoints:
+                assert rows[0][2] == 10, "cards start at row 9"
+                assert rows[0][1] == 14, "full-width cards, without a sidebar"
+            else:
+                assert len(rows) >= 7, (
+                    "wide active list uses available height for labels and summaries"
+                )
             assert all(col == rows[0][1] for _, col, _ in rows), "left-aligned names"
             for _, col, row in rows:
-                line = terminal.screen.display[row + 1]
+                rule_row = row - 1 + row_stride(terminal, prefix) - 1
+                line = terminal.screen.display[rule_row]
                 assert "────" in line[:32], "separator below each summary"
                 label = terminal.screen.buffer[row - 1][col - 1]
-                rule = terminal.screen.buffer[row + 1][col - 1]
+                rule = terminal.screen.buffer[rule_row][col - 1]
                 assert luminance(rule.fg) > luminance(label.fg), "faint separators"
+            if endpoints:
+                cards = endpoint_cards("\n".join(terminal.screen.display))
+                assert len(cards) == 3, (
+                    "three complete endpoint cards, no detail duplication"
+                )
+                assert "smoke-secret" not in "\n".join(terminal.screen.display), (
+                    "card connection labels redact credentials"
+                )
+                for card in cards.values():
+                    assert "host='127.0.0.1'" in card[1], "card connection label"
+                    assert "password='***'" in card[1], "redacted card password"
+                    assert "Current:" in card[2] and "Last result:" in card[3]
+                    assert "Last result latency:" in card[4] and "ok " in card[4]
+                    assert card[5].count("─") >= terminal.screen.columns - 4, (
+                        "card rule spans the full viewport width"
+                    )
+                selected_bg = terminal.screen.buffer[rows[0][2] - 1][rows[0][1] - 1].bg
+                other_bg = terminal.screen.buffer[rows[1][2] - 1][rows[1][1] - 1].bg
+                assert selected_bg != other_bg, "selected card is highlighted"
+                assert all(
+                    cell.bg != selected_bg for cell in terminal.label_cells("[h/l]")
+                ), "canary header is not endpoint selection highlighting"
             capacity = len(rows)
             bar_col, top, bottom, thumb_style, initial_thumb = scrollbar(
-                terminal, rows, total
+                terminal, rows, total, prefix
             )
             check_tab_colors(terminal, active)
             terminal.click_label(inactive)
             check_tab_colors(terminal, inactive)
+            terminal.settle()
             assert not list_rows(terminal, prefix), (
                 "only the active tab's list is rendered"
             )
@@ -434,7 +548,7 @@ def check_list_navigation(executable, endpoints=False):
             terminal.send(page)
             terminal.wheel(rows[0][1], rows[0][2])
             viewport(terminal, prefix, first=1, count=capacity)
-            terminal.contains(f"{detail} {prefix}-00")
+            browsed()
             terminal.wheel(rows[0][1], rows[0][2], down=False)
             viewport(terminal, prefix, first=0, count=capacity)
             terminal.wheel(rows[0][1], rows[0][2], down=False)
@@ -446,7 +560,7 @@ def check_list_navigation(executable, endpoints=False):
             for _ in range(5):
                 terminal.wheel(rows[0][1], rows[0][2])
             rows = viewport(terminal, prefix, first=6, count=capacity)
-            terminal.contains(f"{detail} {prefix}-00")
+            browsed()
             moved_thumb = []
             for row in range(top, bottom + 1):
                 cell = terminal.screen.buffer[row - 1][bar_col - 1]
@@ -463,25 +577,28 @@ def check_list_navigation(executable, endpoints=False):
             if endpoints:
                 terminal.send("j")
                 terminal.contains("Canary: check-01")
+                canary_index = 1
             terminal.send(page)
             viewport(terminal, prefix, first=6, count=capacity)
-            terminal.contains(f"{detail} {prefix}-00")
-            if endpoints:
-                terminal.contains("Canary 2/2: check-01")
+            browsed()
             terminal.send("k")
             viewport(terminal, prefix, first=0, count=capacity)
             terminal.contains(f"{detail} {prefix}-00")
+            header()
             terminal.send("\x1b[A")
             terminal.settle()
             viewport(terminal, prefix, first=0, count=capacity)
             terminal.contains(f"{detail} {prefix}-00")
             terminal.send("j")
             terminal.contains(f"{detail} {prefix}-01")
+            header()
             terminal.send("\x1b[B")
             terminal.contains(f"{detail} {prefix}-02")
+            header()
             terminal.send("j" * total)
             terminal.contains(f"{detail} {prefix}-{total - 1:02}")
             viewport(terminal, prefix, first=total - capacity, count=capacity)
+            header()
             terminal.send("j\x1b[B")
             terminal.settle()
             terminal.contains(f"{detail} {prefix}-{total - 1:02}")
@@ -489,17 +606,18 @@ def check_list_navigation(executable, endpoints=False):
             terminal.send("k" * total)
             terminal.contains(f"{detail} {prefix}-00")
             viewport(terminal, prefix, first=0, count=capacity)
+            header()
             terminal.click(bar_col, bottom)
             terminal.settle()
             rows = viewport(terminal, prefix)
             assert rows[0][0] > 0, "track click scrolls viewport"
-            terminal.contains(f"{detail} {prefix}-00")
+            browsed()
             # Drag from the track's bottom to top, then drag the thumb to bottom.
             terminal.drag(bar_col, bottom, top)
             viewport(terminal, prefix, first=0, count=capacity)
             terminal.drag(bar_col, top, bottom)
             rows = viewport(terminal, prefix, first=total - capacity, count=capacity)
-            terminal.contains(f"{detail} {prefix}-00")
+            browsed()
             clicked, col, row = rows[1]
             terminal.click(col, row)
             terminal.contains(f"{detail} {prefix}-{clicked:02}")
@@ -523,12 +641,18 @@ def check_list_navigation(executable, endpoints=False):
                     "resize keeps selection visible"
                 )
                 terminal.contains(f"{detail} {prefix}-{clicked:02}")
+                header()
                 detail_row = next(
                     y
                     for y, line in enumerate(terminal.screen.display)
                     if f"{detail} {prefix}-" in line
                 )
-                if cols == 80:
+                if endpoints:
+                    assert rows[0][2] == 10, "sticky header above cards after resize"
+                    assert len(rows) == (height - 12) // 6, (
+                        "only complete six-line cards"
+                    )
+                elif cols == 80:
                     assert len(rows) <= 6, "narrow list reserves detail space"
                     assert detail_row + 1 > rows[-1][2], "narrow details below list"
                     if not endpoints:
@@ -542,14 +666,60 @@ def check_list_navigation(executable, endpoints=False):
                 assert "q quit" in terminal.screen.display[-1], "footer survives resize"
             if endpoints:
                 terminal.send("h")
-                terminal.contains("Canary 1/2: check-00")
+                canary_index = 0
+                header()
                 terminal.send("l")
-                terminal.contains("Canary 2/2: check-01")
-                terminal.contains("[h/l]")
+                canary_index = 1
+                header()
                 terminal.send("\x1b[D")
-                terminal.contains("Canary 1/2: check-00")
+                canary_index = 0
+                header()
                 terminal.send("\x1b[C")
-                terminal.contains("Canary 2/2: check-01")
+                canary_index = 1
+                header()
+                terminal.send("1")
+                terminal.contains("Canary: check-01")
+                terminal.send("2")
+                header()
+                terminal.send("k" * total)
+                terminal.contains("> Endpoint: target-00")
+                rows = viewport(terminal, prefix, first=0, count=capacity)
+                for _ in range(6):
+                    terminal.wheel(rows[0][1], rows[0][2])
+                rows = viewport(terminal, prefix, first=6, count=capacity)
+                browsed()
+                terminal.click(rows[0][1], 28)
+                terminal.settle()
+                browsed()
+                terminal.send("x")
+                terminal.contains("Remove selected item?")
+                terminal.contains("Endpoint: target-00")
+                check_overlay(terminal, "Remove selected item?")
+                terminal.send("\x1b")
+                terminal.wait(
+                    lambda screen: "Remove selected item?" not in screen,
+                    "endpoint confirmation cancelled",
+                )
+                assert '"target-00"' in path.read_text(), (
+                    "cancel preserves offscreen target"
+                )
+                browsed()
+                # A card click in the same batch cannot retarget the removal.
+                _, col, row = rows[0]
+                terminal.send(f"x\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m")
+                terminal.contains("Remove selected item?")
+                terminal.settle()
+                terminal.contains("Endpoint: target-00")
+                terminal.send("\r")
+                terminal.contains("> Endpoint: target-01")
+                saved = path.read_text()
+                assert '"target-00"' not in saved and '"target-06"' in saved, (
+                    "removal uses offscreen selection, not browsed or clicked card"
+                )
+                assert all(f'"check-{i:02}"' in saved for i in range(2)), (
+                    "endpoint removal never removes the shared selected canary"
+                )
+                header()
             else:
                 terminal.resize(80, 24)
                 terminal.settle()
@@ -597,7 +767,7 @@ def main():
     check_list_navigation(executable, endpoints=True)
     if sys.argv[1:] == ["--lists-only"]:
         print(
-            "PASS: seeded list PTYs, scrolling, selection, tabs, colors/focus, resize, h/l"
+            "PASS: seeded Canaries list / endpoint cards, scrolling, selection, tabs, colors/focus, resize, shared h/l header, offscreen removal"
         )
         return
     conninfo = os.environ.get("MZ_WATCH_SMOKE_CONNINFO")
@@ -685,14 +855,18 @@ def main():
             "restored endpoint connects and restored canary runs",
         )
         terminal.send("jk2")
-        terminal.contains("Last result: success")
+        endpoint_outcome(terminal, "primary", "success")
         terminal.send("\x1b[C")
-        terminal.contains("SQLSTATE 22012")
+        endpoint_outcome(terminal, "primary", "query_error")
         terminal.send("\x1b[D1k")
         terminal.contains("Canary: latency  [paused]")
         terminal.send("2")
-        terminal.contains("primary")
-        terminal.contains("skipped")
+        terminal.wait(
+            lambda screen: (
+                "skipped" in endpoint_cards(screen).get("primary", [""] * 6)[4]
+            ),
+            "paused primary card retains its skipped counter",
+        )
         terminal.send("x")
         terminal.contains("Remove selected item?")
         terminal.send("\t\r")
