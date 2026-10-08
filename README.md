@@ -36,20 +36,34 @@ hostaddr=127.0.0.1 port=6875 user=materialize dbname=materialize
 
 Use `sslmode=verify-full` with the appropriate CA for remote TLS endpoints.
 Prefer `.pgpass` or libpq service files to embedding passwords. Connection strings
-are saved verbatim in the private configuration file, but not displayed after
-creation. Embedded passwords are stored in plaintext.
+are saved verbatim in the private configuration file. Endpoint details show
+normalized explicit connection options with password fields redacted.
+Embedded passwords are stored in plaintext on disk.
 
 The Canaries and Endpoints tabs select the detail panel. `1` and `2` select those
 tabs, `j`/`k` or the arrow keys select an item, `p` pauses the selected canary,
 and `x` opens removal confirmation. Tab moves focus between controls, Enter
 activates them, and Escape cancels a form. Quit with `q` or Ctrl-C.
-In the Endpoints tab, use the previous/next canary buttons or left/right keys to
+Forms and removal confirmations are centered overlays over a dimmed dashboard.
+Removal defaults to Confirm, so Enter removes the item. Escape or Cancel closes
+the dialog without changing it. The background cannot be clicked while a dialog
+is open.
+In the Endpoints tab, use `h`/`l` or the previous/next canary buttons to
 inspect each endpoint/canary pair. Current activity and the last completed
 result are shown separately, so a retry does not erase the last diagnostic.
+Left/right arrows remain aliases for `h`/`l`.
+
+Each tab shows a multi-row list. `j`/`k` select items and keep the selection in
+view. Mouse-wheel scrolling browses the list without changing the selected
+item. Labels are left-aligned, with status summaries and faint separators.
+Click a row to select it, or click and drag the scrollbar to browse.
+The two tabs retain their own scroll positions within the session.
 
 Light mode is the default, with pale backgrounds, bordered panels and teal
 accents. A terminal color-scheme report switches the palette automatically.
-At 80x24 both charts fit. Wider terminals also show both item lists.
+The active tab is white in light mode, with a teal inactive tab. Keyboard focus
+is underlined rather than changing which tab looks active. At 80x24 both charts
+fit below the list. Wider terminals put the active list beside the details.
 Smaller terminals keep controls and measurements accessible, hiding charts when
 there is not enough room.
 
@@ -101,6 +115,11 @@ from the run's start through receipt of all query results. It includes a
 not the cleanup `ROLLBACK`. Errors never win. A run without any success is
 counted as failed, including runs where every endpoint was busy or unavailable.
 With no endpoints configured, no runs are sampled.
+
+Dispatch and socket servicing rotate endpoint priority. Wins need not be evenly
+distributed, even for two connections to the same server. When multiple sockets
+are ready together, polling cannot establish their response arrival order.
+Wins reflect the first complete success observed by the client.
 
 The histogram and mean use the current second and preceding 59 seconds.
 The time plot shows per-second means. Seconds without successful samples are

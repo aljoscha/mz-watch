@@ -101,9 +101,10 @@ test "responsive frames preserve footer and fit both charts at 80x24" {
     defer model.deinit();
     model.canaries.items[0].stats.record(@divFloor(api.nowNs(std.testing.io), std.time.ns_per_ms), 20);
     const sizes = [_]vxfw.Size{
-        .{ .width = 0, .height = 0 },    .{ .width = 1, .height = 1 },     .{ .width = 20, .height = 8 },
-        .{ .width = 35, .height = 15 },  .{ .width = 74, .height = 24 },   .{ .width = 80, .height = 24 },
-        .{ .width = 120, .height = 32 }, .{ .width = 250, .height = 120 },
+        .{ .width = 0, .height = 0 },     .{ .width = 1, .height = 1 },    .{ .width = 20, .height = 8 },
+        .{ .width = 35, .height = 15 },   .{ .width = 74, .height = 24 },  .{ .width = 80, .height = 24 },
+        .{ .width = 80, .height = 40 },   .{ .width = 112, .height = 32 }, .{ .width = 120, .height = 32 },
+        .{ .width = 250, .height = 120 },
     };
     for (sizes) |size| {
         var arena = std.heap.ArenaAllocator.init(a);

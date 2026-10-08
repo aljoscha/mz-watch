@@ -1,8 +1,21 @@
 //! The stable libpq C ABI used by the runner. Connection and result ownership
-//! stay on the database thread. No libpq call belongs in a UI event handler.
+//! stay on the database thread. Only connection-string parsing belongs on the UI
+//! thread. It performs no network I/O.
 pub const Conn = opaque {};
 pub const Result = opaque {};
 pub const NoticeProcessor = *const fn (?*anyopaque, [*:0]const u8) callconv(.c) void;
+pub const ConninfoOption = extern struct {
+    keyword: ?[*:0]u8,
+    envvar: ?[*:0]u8,
+    compiled: ?[*:0]u8,
+    val: ?[*:0]u8,
+    label: ?[*:0]u8,
+    dispchar: ?[*:0]u8,
+    dispsize: c_int,
+};
+pub extern "pq" fn PQconninfoParse([*:0]const u8, *?[*:0]u8) ?[*]ConninfoOption;
+pub extern "pq" fn PQconninfoFree([*]ConninfoOption) void;
+pub extern "pq" fn PQfreemem(*anyopaque) void;
 
 pub extern "pq" fn PQconnectStart(conninfo: [*:0]const u8) ?*Conn;
 pub extern "pq" fn PQconnectPoll(conn: *Conn) c_int;
