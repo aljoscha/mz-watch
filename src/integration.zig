@@ -168,6 +168,19 @@ fn firstSuccess(a: std.mem.Allocator, io: std.Io, conninfo: []const u8) !void {
     std.debug.print("PASS: early winner, losing visibility, in-flight pause\n", .{});
 }
 
+fn concurrentQueries(a: std.mem.Allocator, io: std.Io, conninfo: []const u8, observer: Observer) !void {
+    var h = Harness.init(a, io);
+    defer h.deinit();
+    try h.prepare(conninfo, "SELECT pg_sleep(1) /* mz_watch_overlap */", 60_000, 10_000, true);
+    // Server-side overlap proves independent execution, not just two sockets
+    // or a client-side timing threshold that depends on machine load.
+    try observer.waitFor(&h, "SELECT count(*) = 2 FROM pg_stat_activity WHERE application_name IN ('fast', 'slow') AND state = 'active' AND wait_event = 'PgSleep' AND query LIKE '%mz_watch_overlap%'");
+    _ = try h.waitStatus(fast, .success);
+    _ = try h.waitStatus(slow, .success);
+    try expect(h.samples() == 1, "concurrent successes publish exactly one winner");
+    std.debug.print("PASS: both canary queries execute concurrently on the server\n", .{});
+}
+
 fn errors(a: std.mem.Allocator, io: std.Io, conninfo: []const u8, observer: Observer) !void {
     {
         var h = Harness.init(a, io);
@@ -337,6 +350,7 @@ pub fn main(init: std.process.Init) !void {
     const observer = try Observer.init(a, conninfo);
     defer pq.PQfinish(observer.conn);
     try firstSuccess(a, init.io, conninfo);
+    try concurrentQueries(a, init.io, conninfo, observer);
     try errors(a, init.io, conninfo, observer);
     try timeouts(a, init.io, conninfo);
     try skippedSchedules(a, init.io, conninfo);

@@ -147,6 +147,8 @@ const Canary = struct {
     slots: std.ArrayList(Slot) = .empty,
     paused: bool = false,
     next_ns: i64 = 0,
+    dispatch_start: usize = 0,
+    poll_start: usize = 0,
 };
 
 const State = struct {
@@ -299,7 +301,12 @@ const State = struct {
         for (canary.slots.items) |*slot| if (slot.phase == .ready) {
             slot.race = race;
         };
-        for (canary.slots.items) |*slot| {
+        // Sequential socket operations cannot be simultaneous. Rotate priority
+        // so near-ties do not permanently favor endpoint insertion order.
+        const start = canary.dispatch_start % canary.slots.items.len;
+        canary.dispatch_start = (start + 1) % canary.slots.items.len;
+        for (0..canary.slots.items.len) |offset| {
+            const slot = &canary.slots.items[(start + offset) % canary.slots.items.len];
             if (slot.race != race) continue;
             slot.deadline_ns = now + @as(i64, canary.config.timeout_ms) * std.time.ns_per_ms;
             try self.report(canary, slot, .running, null);
@@ -404,10 +411,18 @@ const State = struct {
             _ = std.c.poll(self.polls.items.ptr, @intCast(self.polls.items.len), 2);
             var index: usize = 0;
             for (self.canaries.items) |*canary| {
-                for (canary.slots.items) |*slot| {
-                    try self.step(canary, slot, self.polls.items[index].revents, nowNs(runner.io));
-                    index += 1;
+                const count = canary.slots.items.len;
+                if (count > 0) {
+                    const start = canary.poll_start % count;
+                    canary.poll_start = (start + 1) % count;
+                    // poll reports readiness, not arrival order across sockets.
+                    // Rotate servicing without delaying publication of a winner.
+                    for (0..count) |offset| {
+                        const slot_index = (start + offset) % count;
+                        try self.step(canary, &canary.slots.items[slot_index], self.polls.items[index + slot_index].revents, nowNs(runner.io));
+                    }
                 }
+                index += count;
                 try self.schedule(canary, nowNs(runner.io));
             }
         }
