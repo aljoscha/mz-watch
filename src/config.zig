@@ -14,16 +14,27 @@ pub const Canary = struct {
     paused: bool = false,
 };
 
+pub const Controller = struct {
+    name: []const u8,
+    url: []const u8,
+    conninfo: []const u8 = "user=materialize dbname=materialize",
+};
+
 pub const Config = struct {
     endpoints: []const Endpoint = &.{},
     canaries: []const Canary = &.{},
+    controllers: []const Controller = &.{},
+    /// The selected controller's URL, independent of its display name.
+    collections_controller: ?[]const u8 = null,
+    collection_id_filter: []const u8 = "",
+    collection_name_filter: []const u8 = "",
 };
 
-fn validateString(value: []const u8, name: bool) !void {
-    if (std.mem.trim(u8, value, " \t\r\n").len == 0 or std.mem.indexOfScalar(u8, value, 0) != null)
+fn validateString(value: []const u8, control_free: bool, allow_empty: bool) !void {
+    if ((!allow_empty and std.mem.trim(u8, value, " \t\r\n").len == 0) or std.mem.indexOfScalar(u8, value, 0) != null)
         return error.InvalidConfig;
     const view = std.unicode.Utf8View.init(value) catch return error.InvalidConfig;
-    if (name) {
+    if (control_free) {
         var iter = view.iterator();
         while (iter.nextCodepoint()) |cp| {
             if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f)) return error.InvalidConfig;
@@ -31,16 +42,44 @@ fn validateString(value: []const u8, name: bool) !void {
     }
 }
 
+fn validateControllerUrl(url: []const u8) !void {
+    try validateString(url, true, false);
+    const uri = std.Uri.parse(url) catch return error.InvalidConfig;
+    if ((!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) or
+        uri.user != null or uri.password != null or uri.query != null or uri.fragment != null)
+        return error.InvalidConfig;
+    const host = uri.host orelse return error.InvalidConfig;
+    if (host.isEmpty()) return error.InvalidConfig;
+    // Uri.parse is permissive about character classes and percent escapes.
+    for (url, 0..) |byte, i| {
+        if (std.mem.indexOfScalar(u8, " \\\"<>`{}|^", byte) != null) return error.InvalidConfig;
+        if (byte == '%' and (url.len - i < 3 or !std.ascii.isHex(url[i + 1]) or !std.ascii.isHex(url[i + 2])))
+            return error.InvalidConfig;
+    }
+}
+
 pub fn validate(config: Config) !void {
     for (config.endpoints) |endpoint| {
-        try validateString(endpoint.name, true);
-        try validateString(endpoint.conninfo, false);
+        try validateString(endpoint.name, true, false);
+        try validateString(endpoint.conninfo, false, false);
     }
     for (config.canaries) |canary| {
-        try validateString(canary.name, true);
-        try validateString(canary.sql, false);
+        try validateString(canary.name, true, false);
+        try validateString(canary.sql, false, false);
         if (canary.interval_ms == 0 or canary.timeout_ms == 0) return error.InvalidConfig;
     }
+    for (config.controllers, 0..) |controller, i| {
+        try validateString(controller.name, true, false);
+        try validateControllerUrl(controller.url);
+        try validateString(controller.conninfo, true, false);
+        for (config.controllers[0..i]) |other| {
+            if (std.mem.eql(u8, std.mem.trimEnd(u8, controller.url, "/"), std.mem.trimEnd(u8, other.url, "/")))
+                return error.InvalidConfig;
+        }
+    }
+    if (config.collections_controller) |url| try validateControllerUrl(url);
+    try validateString(config.collection_id_filter, true, true);
+    try validateString(config.collection_name_filter, true, true);
 }
 
 /// Results belong to arena and do not borrow source. Errors contain no source text.
@@ -120,6 +159,13 @@ test "native ZON roundtrip escaped UTF-8 strings, multiline SQL and paused state
             .timeout_ms = 91,
             .paused = true,
         }},
+        .controllers = &.{
+            .{ .name = "controller 東京", .url = "https://localhost:6878/base/", .conninfo = "user=materialize dbname='café'" },
+            .{ .name = "controller 東京", .url = "http://[::1]:6878" },
+        },
+        .collections_controller = "https://localhost:6878/base/",
+        .collection_id_filter = "u%_",
+        .collection_name_filter = "café \\",
     };
     var writer: std.Io.Writer.Allocating = .init(gpa);
     defer writer.deinit();
@@ -141,6 +187,11 @@ test "defaults and invalid content" {
     try std.testing.expectEqual(@as(u32, 1000), config.canaries[0].interval_ms);
     try std.testing.expectEqual(@as(u32, 5000), config.canaries[0].timeout_ms);
     try std.testing.expect(!config.canaries[0].paused);
+    try std.testing.expectEqualDeep(Config{ .canaries = config.canaries }, config);
+    const controller_config = try parse(gpa, arena.allocator(),
+        \\.{ .controllers = .{ .{ .name = "local", .url = "http://localhost:6878" } } }
+    );
+    try std.testing.expectEqualStrings("user=materialize dbname=materialize", controller_config.controllers[0].conninfo);
 
     const invalid = [_][:0]const u8{
         "not ZON",
@@ -177,6 +228,46 @@ test "defaults and invalid content" {
     }
 }
 
+test "controllers reject invalid text, unsafe base URLs and duplicate URLs" {
+    for ([_][]const u8{ "", " ", "bad\n", "bad\x7f", "bad\u{85}", "bad\x00", "bad\xff" }) |invalid| {
+        try std.testing.expectError(error.InvalidConfig, validate(.{
+            .controllers = &.{.{ .name = invalid, .url = "http://localhost" }},
+        }));
+        try std.testing.expectError(error.InvalidConfig, validate(.{
+            .controllers = &.{.{ .name = "local", .url = "http://localhost", .conninfo = invalid }},
+        }));
+    }
+    for ([_][]const u8{
+        "",                        " ",                             "localhost",            "ftp://localhost",           "http:///path",                 "http://:6878",
+        "http://localhost:bad",    "http://localhost:65536",        "http://[::1",          "http://user@localhost",     "http://user:secret@localhost", "http://@localhost",
+        "http://localhost?",       "http://localhost?secret=value", "http://localhost#",    "http://localhost#fragment", "http://local host",            "http://localhost/path with spaces",
+        "http://localhost/\\path", "http://localhost/%",            "http://localhost/%zz", "http://localhost/\n",       "http://localhost/\xff",
+    }) |url| {
+        try std.testing.expectError(error.InvalidConfig, validate(.{
+            .controllers = &.{.{ .name = "local", .url = url }},
+        }));
+        try std.testing.expectError(error.InvalidConfig, validate(.{ .collections_controller = url }));
+    }
+    for ([_][]const u8{ "http://localhost/base", "http://localhost/base/", "http://localhost/base///" }) |url| {
+        try std.testing.expectError(error.InvalidConfig, validate(.{
+            .controllers = &.{
+                .{ .name = "one", .url = "http://localhost/base" },
+                .{ .name = "two", .url = url },
+            },
+        }));
+    }
+}
+
+test "collection filters allow empty text and SQL LIKE patterns but reject invalid text" {
+    for ([_][]const u8{ "", " ", "u%_", "東京", "trailing\\" }) |filter| {
+        try validate(.{ .collection_id_filter = filter, .collection_name_filter = filter });
+    }
+    for ([_][]const u8{ "\x00", "\n", "\t", "\x7f", "\u{85}", "\xff" }) |filter| {
+        try std.testing.expectError(error.InvalidConfig, validate(.{ .collection_id_filter = filter }));
+        try std.testing.expectError(error.InvalidConfig, validate(.{ .collection_name_filter = filter }));
+    }
+}
+
 test "missing load, private atomic replacement and failed save preservation" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -198,7 +289,13 @@ test "missing load, private atomic replacement and failed save preservation" {
     }
     // Replacement must not inherit a permissive mode from the old file.
     try tmp.dir.setFilePermissions(io, "nested/private/config.zon", .fromMode(0o644), .{});
-    const second: Config = .{ .canaries = &.{.{ .name = "check", .sql = "SELECT 1\n", .paused = true }} };
+    const second: Config = .{
+        .canaries = &.{.{ .name = "check", .sql = "SELECT 1\n", .paused = true }},
+        .controllers = &.{.{ .name = "local", .url = "http://localhost:6878" }},
+        .collections_controller = "http://localhost:6878",
+        .collection_id_filter = "u%",
+        .collection_name_filter = "東京_",
+    };
     try save(gpa, io, path, second);
     try std.testing.expectEqualDeep(second, try load(gpa, arena.allocator(), io, path));
     const stat = try tmp.dir.statFile(io, "nested/private/config.zon", .{});

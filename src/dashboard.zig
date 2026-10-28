@@ -4,10 +4,11 @@ const vxfw = vaxis.vxfw;
 const runner_mod = @import("runner.zig");
 const metrics = @import("metrics.zig");
 const config = @import("config.zig");
+const monitoring = @import("monitoring.zig");
 
 const Palette = @import("theme.zig").Palette;
 
-const Endpoint = struct { id: u64, name: []const u8, conninfo: []const u8, label: []const u8 };
+const Endpoint = struct { id: u64, name: []const u8, conninfo: []const u8, label: []const u8, manual: bool = true, sources: ?[]const u8 = null };
 const Observation = struct {
     status: runner_mod.Status = .connecting,
     last_status: ?runner_mod.Status = null,
@@ -29,10 +30,10 @@ const Canary = struct {
     winner: ?u64 = null,
     observations: std.AutoHashMapUnmanaged(u64, Observation) = .empty,
 };
-const Page = enum { canaries, endpoints };
-const Form = enum { none, endpoint, canary, remove_endpoint, remove_canary };
-const Action = enum { add_endpoint, add_canary, remove, pause, show_canaries, show_endpoints, quit, save, cancel, prev_canary, next_canary };
-const toolbar_actions = [_]Action{ .add_endpoint, .add_canary, .remove, .pause, .show_canaries, .show_endpoints, .quit, .prev_canary, .next_canary };
+const Page = enum { canaries, endpoints, services, collections };
+const Form = enum { none, endpoint, canary, controller, filters, remove_endpoint, remove_canary, remove_controller };
+const Action = enum { add_endpoint, add_canary, remove, pause, show_canaries, show_endpoints, quit, save, cancel, prev_canary, next_canary, add_controller, show_services, show_collections, prev_controller, next_controller, filter };
+
 const ListArea = struct {
     x: usize = 0,
     y: usize = 0,
@@ -104,13 +105,39 @@ const Row = struct {
         const width: usize = surface.size.width;
         const height: usize = surface.size.height;
         if (width == 0 or height == 0) return surface;
+        if (self.page == .collections) {
+            const rows = self.owner.monitor.collections();
+            if (self.id >= rows.len) return surface;
+            const value = rows[@intCast(self.id)];
+            const name_width = (width -| 14) / 2;
+            text(surface, ctx, 0, 0, 13, button.label, style);
+            text(surface, ctx, 14, 0, name_width, value.name orelse "(unnamed)", style);
+            const since_x = 15 + name_width;
+            text(surface, ctx, since_x, 0, width -| since_x, if (value.since) |frontier| try std.json.Stringify.valueAlloc(ctx.arena, frontier, .{}) else "unknown", style);
+            return surface;
+        }
+        if (self.page == .services) {
+            text(surface, ctx, 0, 0, width, button.label, style);
+            var muted = self.owner.colors.muted;
+            muted.bg = style.bg;
+            if (height > 1) {
+                var lines = std.mem.splitScalar(u8, self.summary, '\n');
+                var line: usize = 1;
+                while (lines.next()) |value| {
+                    if (line >= height) break;
+                    text(surface, ctx, 2, line, width -| 2, value, muted);
+                    line += 1;
+                }
+            }
+            return surface;
+        }
         if (self.page == .endpoints) {
             const endpoint_index = self.owner.endpointIndex(self.id) orelse return surface;
             const endpoint = self.owner.endpoints.items[endpoint_index];
             var muted = self.owner.colors.muted;
             muted.bg = style.bg;
             text(surface, ctx, 0, 0, width, button.label, style);
-            text(surface, ctx, 2, 1, width -| 2, endpoint.label, muted);
+            text(surface, ctx, 2, 1, width -| 2, if (endpoint.sources) |sources| try std.fmt.allocPrint(ctx.arena, "[discovered {s}] {s}", .{ sources, endpoint.label }) else endpoint.label, muted);
             if (self.owner.selectedCanary()) |canary| {
                 const value: Observation = canary.observations.get(endpoint.id) orelse .{};
                 var current_style = statusStyle(self.owner.colors, value.status);
@@ -151,9 +178,13 @@ const Row = struct {
         if (self.owner.form != .none) return ctx.consumeEvent();
         self.owner.page = self.page;
         self.owner.toolbar_focus = null;
-        const index = if (self.page == .canaries) self.owner.canaryIndex(self.id) else self.owner.endpointIndex(self.id);
+        const index = switch (self.page) {
+            .canaries => self.owner.canaryIndex(self.id),
+            .endpoints => self.owner.endpointIndex(self.id),
+            else => @as(?usize, @intCast(self.id)),
+        };
         if (index) |i| {
-            if (self.page == .canaries) self.owner.canary_index = i else self.owner.endpoint_index = i;
+            self.owner.pageIndex().* = i;
             self.owner.viewports[@backingInt(self.page)].ensure_selection = true;
         }
         try ctx.requestFocus(self.owner.widget());
@@ -170,7 +201,7 @@ pub const Dashboard = struct {
     // Row widgets are reused by visible position. Their lifetime is independent
     // of config deletion, including focus and mouse events from the last frame.
     rows: std.ArrayList(*Row) = .empty,
-    controls: [11]Control = undefined,
+    controls: [17]Control = undefined,
     fields: [4]vxfw.TextField = undefined,
     form: Form = .none,
     page: Page = .canaries,
@@ -182,15 +213,20 @@ pub const Dashboard = struct {
     message: []const u8 = "",
     config_path: ?[]const u8 = null,
     save_error: ?anyerror = null,
-    viewports: [2]Viewport = .{ .{}, .{} },
+    viewports: [4]Viewport = @splat(.{}),
+    monitor: monitoring.Monitor,
+    monitor_started: bool = false,
+    service_index: usize = 0,
+    collection_index: usize = 0,
+    remove_controller_index: usize = 0,
     list_area: ListArea = .{},
     scrollbar_drag: ?usize = null,
     modal_area: ListArea = .{},
 
     /// Initialize only after placement at a stable address.
     pub fn init(self: *Dashboard, allocator: std.mem.Allocator, runner: *runner_mod.Runner) void {
-        self.* = .{ .allocator = allocator, .runner = runner };
-        const labels = [_][]const u8{ "+ Endpoint", "+ Canary", "Remove", "Pause/resume", "Canaries", "Endpoints", "Quit", "Save", "Cancel", "< Canary", "Canary >" };
+        self.* = .{ .allocator = allocator, .runner = runner, .monitor = monitoring.Monitor.init(allocator, runner.io) };
+        const labels = [_][]const u8{ "+ Endpoint", "+ Canary", "Remove", "Pause/resume", "Canaries", "Endpoints", "Quit", "Save", "Cancel", "< Canary", "Canary >", "+ Controller", "Services", "Collections", "< Controller", "Controller >", "Filter" };
         inline for (std.meta.tags(Action), 0..) |action, i| {
             self.controls[i] = .{ .owner = self, .action = action, .button = .{ .label = labels[i], .onClick = Control.click } };
             self.controls[i].button.userdata = &self.controls[i];
@@ -206,11 +242,13 @@ pub const Dashboard = struct {
     }
 
     pub fn deinit(self: *Dashboard) void {
+        self.monitor.deinit();
         for (&self.fields) |*field| field.deinit();
         for (self.endpoints.items) |endpoint| {
             self.allocator.free(endpoint.name);
             self.allocator.free(endpoint.conninfo);
             self.allocator.free(endpoint.label);
+            if (endpoint.sources) |value| self.allocator.free(value);
         }
         for (self.canaries.items) |*canary| self.freeCanary(canary);
         for (self.rows.items) |item| self.allocator.destroy(item);
@@ -230,6 +268,7 @@ pub const Dashboard = struct {
     pub fn loadConfiguration(self: *Dashboard, saved: config.Config) !void {
         for (saved.endpoints) |endpoint| try self.addEndpoint(endpoint.name, endpoint.conninfo);
         for (saved.canaries) |canary| try self.addCanary(canary);
+        try self.monitor.load(saved);
         self.endpoint_index = 0;
         self.canary_index = 0;
     }
@@ -283,11 +322,11 @@ pub const Dashboard = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const endpoints = try a.alloc(config.Endpoint, self.endpoints.items.len);
-        for (endpoints, self.endpoints.items) |*saved, endpoint| saved.* = .{ .name = endpoint.name, .conninfo = endpoint.conninfo };
+        var endpoints: std.ArrayList(config.Endpoint) = .empty;
+        for (self.endpoints.items) |endpoint| if (endpoint.manual) try endpoints.append(a, .{ .name = endpoint.name, .conninfo = endpoint.conninfo });
         const canaries = try a.alloc(config.Canary, self.canaries.items.len);
         for (canaries, self.canaries.items) |*saved, canary| saved.* = .{ .name = canary.name, .sql = canary.sql, .interval_ms = canary.interval_ms, .timeout_ms = canary.timeout_ms, .paused = canary.paused };
-        try config.save(a, self.runner.io, path, .{ .endpoints = endpoints, .canaries = canaries });
+        try config.save(a, self.runner.io, path, .{ .endpoints = endpoints.items, .canaries = canaries, .controllers = try self.monitor.configuration(a), .collections_controller = self.monitor.selectedUrl(), .collection_id_filter = self.monitor.id_filter, .collection_name_filter = self.monitor.name_filter });
     }
 
     pub fn widget(self: *Dashboard) vxfw.Widget {
@@ -311,6 +350,10 @@ pub const Dashboard = struct {
     }
 
     fn drain(self: *Dashboard) !void {
+        if (self.monitor_started) {
+            try self.monitor.drain();
+            try self.reconcileDiscovery();
+        }
         var events = self.runner.takeEvents();
         defer events.deinit(self.allocator);
         for (events.items) |ev| switch (ev) {
@@ -360,8 +403,8 @@ pub const Dashboard = struct {
         if (ev == .mouse and self.form == .none) {
             if (try self.scrollMouse(ctx, ev.mouse)) return;
         }
-        if (ev == .mouse and ev.mouse.type == .press and ev.mouse.button == .left and (self.form == .endpoint or self.form == .canary)) {
-            const count: usize = if (self.form == .endpoint) 2 else 4;
+        if (ev == .mouse and ev.mouse.type == .press and ev.mouse.button == .left and (self.formFieldCount() > 0)) {
+            const count: usize = self.formFieldCount();
             const row_y = @as(i32, ev.mouse.row) - @as(i32, @intCast(self.modal_area.y));
             for (0..count) |i| {
                 if (row_y == 4 + i * 2) {
@@ -381,13 +424,13 @@ pub const Dashboard = struct {
         if (self.form != .none) {
             if (key.matches(vaxis.Key.escape, .{})) return self.act(.cancel, ctx);
             if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
-                const count: usize = if (self.form == .endpoint) 2 else if (self.form == .canary) 4 else 0;
+                const count: usize = self.formFieldCount();
                 const n = count + 2;
                 self.form_focus = (self.form_focus + if (key.mods.shift) n - 1 else @as(usize, 1)) % n;
                 try ctx.requestFocus(if (self.form_focus < count) self.fields[self.form_focus].widget() else self.controls[7 + self.form_focus - count].button.widget());
                 return ctx.consumeAndRedraw();
             }
-            const count: usize = if (self.form == .endpoint) 2 else if (self.form == .canary) 4 else 0;
+            const count: usize = self.formFieldCount();
             // Focus commands are applied after an input batch. Route form keys
             // using the immediate logical focus so Tab followed by pasted text
             // cannot put that text into the previous field.
@@ -397,7 +440,13 @@ pub const Dashboard = struct {
                 return ctx.consumeEvent();
             }
         } else if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
-            const count: usize = if (self.page == .endpoints and self.canaries.items.len > 0) toolbar_actions.len else 7;
+            var actions: std.ArrayList(Action) = .empty;
+            defer actions.deinit(self.allocator);
+            try actions.appendSlice(self.allocator, &.{ .add_endpoint, .add_canary, .add_controller, .remove, .pause, .show_canaries, .show_endpoints, .show_services, .show_collections, .quit });
+            if (self.page == .endpoints and self.canaries.items.len > 0) try actions.appendSlice(self.allocator, &.{ .prev_canary, .next_canary });
+            if (self.page == .collections) try actions.appendSlice(self.allocator, &.{ .prev_controller, .next_controller, .filter });
+            const toolbar_actions = actions.items;
+            const count = toolbar_actions.len;
             const index = for (toolbar_actions[0..count], 0..) |action, i| {
                 if (self.toolbar_focus == action) break i;
             } else if (key.mods.shift) @as(usize, 0) else count - 1;
@@ -427,6 +476,8 @@ pub const Dashboard = struct {
                 if (self.form == .none) _ = try self.scrollMouse(ctx, ev.mouse);
             },
             .init => {
+                try self.monitor.start();
+                self.monitor_started = true;
                 ctx.redraw = true;
                 try ctx.tick(50, self.widget());
             },
@@ -447,7 +498,7 @@ pub const Dashboard = struct {
             },
             .paste => |pasted| {
                 defer self.allocator.free(pasted);
-                if ((self.form == .endpoint or self.form == .canary) and self.form_focus < (if (self.form == .endpoint) @as(usize, 2) else 4)) {
+                if ((self.formFieldCount() > 0) and self.form_focus < self.formFieldCount()) {
                     try self.fields[self.form_focus].insertSliceAtCursor(pasted);
                     ctx.consumeAndRedraw();
                 }
@@ -461,13 +512,19 @@ pub const Dashboard = struct {
                 if (key.matches('x', .{})) return self.act(.remove, ctx);
                 if (key.matches('1', .{})) return self.act(.show_canaries, ctx);
                 if (key.matches('2', .{})) return self.act(.show_endpoints, ctx);
+                if (key.matches('3', .{})) return self.act(.show_services, ctx);
+                if (key.matches('4', .{})) return self.act(.show_collections, ctx);
+                if (key.matches('c', .{})) return self.act(.add_controller, ctx);
+                if (self.page == .collections and key.matches('/', .{})) return self.act(.filter, ctx);
+                if (self.page == .collections and (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{}))) return self.act(.prev_controller, ctx);
+                if (self.page == .collections and (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{}))) return self.act(.next_controller, ctx);
                 if (self.page == .endpoints and (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{}))) return self.act(.prev_canary, ctx);
                 if (self.page == .endpoints and (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{}))) return self.act(.next_canary, ctx);
                 const down = key.matches(vaxis.Key.down, .{}) or key.matches('j', .{});
                 const up = key.matches(vaxis.Key.up, .{}) or key.matches('k', .{});
                 if (up or down) {
-                    const len = if (self.page == .canaries) self.canaries.items.len else self.endpoints.items.len;
-                    const index = if (self.page == .canaries) &self.canary_index else &self.endpoint_index;
+                    const len = self.pageLength();
+                    const index = self.pageIndex();
                     if (len > 0) index.* = if (down) @min(index.* + 1, len - 1) else index.* -| 1;
                     self.viewports[@backingInt(self.page)].ensure_selection = true;
                     ctx.consumeAndRedraw();
@@ -475,6 +532,37 @@ pub const Dashboard = struct {
             },
             else => {},
         }
+    }
+
+    fn formFieldCount(self: *Dashboard) usize {
+        return switch (self.form) {
+            .endpoint, .filters => 2,
+            .canary => 4,
+            .controller => 3,
+            else => 0,
+        };
+    }
+
+    fn isRemoval(self: *Dashboard) bool {
+        return self.form == .remove_canary or self.form == .remove_endpoint or self.form == .remove_controller;
+    }
+
+    fn pageLength(self: *Dashboard) usize {
+        return switch (self.page) {
+            .canaries => self.canaries.items.len,
+            .endpoints => self.endpoints.items.len,
+            .services => self.monitor.serviceCount(),
+            .collections => self.monitor.collectionCount(),
+        };
+    }
+
+    fn pageIndex(self: *Dashboard) *usize {
+        return switch (self.page) {
+            .canaries => &self.canary_index,
+            .endpoints => &self.endpoint_index,
+            .services => &self.service_index,
+            .collections => &self.collection_index,
+        };
     }
 
     fn resetFields(self: *Dashboard) void {
@@ -489,15 +577,28 @@ pub const Dashboard = struct {
     fn act(self: *Dashboard, action: Action, ctx: *vxfw.EventContext) !void {
         switch (action) {
             .quit => ctx.quit = true,
-            .add_endpoint, .add_canary => {
+            .add_endpoint, .add_canary, .add_controller, .filter => {
                 self.resetFields();
-                self.form = if (action == .add_endpoint) .endpoint else .canary;
+                self.form = switch (action) {
+                    .add_endpoint => .endpoint,
+                    .add_canary => .canary,
+                    .add_controller => .controller,
+                    else => .filters,
+                };
                 self.form_focus = 0;
                 self.message = "";
                 if (self.form == .canary) {
                     try self.fields[1].insertSliceAtCursor("SELECT 1");
                     try self.fields[2].insertSliceAtCursor("1000");
                     try self.fields[3].insertSliceAtCursor("5000");
+                }
+                if (self.form == .controller) {
+                    try self.fields[1].insertSliceAtCursor("http://127.0.0.1:6882");
+                    try self.fields[2].insertSliceAtCursor("user=materialize dbname=materialize");
+                }
+                if (self.form == .filters) {
+                    try self.fields[0].insertSliceAtCursor(self.monitor.name_filter);
+                    try self.fields[1].insertSliceAtCursor(self.monitor.id_filter);
                 }
                 try ctx.requestFocus(self.fields[0].widget());
             },
@@ -509,13 +610,24 @@ pub const Dashboard = struct {
                 try ctx.requestFocus(self.widget());
             },
             .save => try self.save(ctx),
-            .show_canaries, .show_endpoints => {
-                self.page = if (action == .show_canaries) .canaries else .endpoints;
+            .show_canaries, .show_endpoints, .show_services, .show_collections => {
+                self.page = switch (action) {
+                    .show_canaries => .canaries,
+                    .show_endpoints => .endpoints,
+                    .show_services => .services,
+                    else => .collections,
+                };
                 try ctx.requestFocus(self.widget());
             },
             .prev_canary, .next_canary => {
                 if (self.canaries.items.len > 0) self.canary_index = if (action == .next_canary) @min(self.canary_index + 1, self.canaries.items.len - 1) else self.canary_index -| 1;
                 self.viewports[@backingInt(Page.canaries)].ensure_selection = true;
+            },
+            .prev_controller, .next_controller => {
+                self.monitor.select(action == .next_controller);
+                self.collection_index = 0;
+                self.viewports[@backingInt(Page.collections)].ensure_selection = true;
+                self.persist();
             },
             .pause => if (self.selectedCanary()) |canary| {
                 try self.runner.pause(canary.id, !canary.paused);
@@ -525,7 +637,17 @@ pub const Dashboard = struct {
             },
             .remove => {
                 if (self.page == .canaries and self.selectedCanary() != null) self.form = .remove_canary;
-                if (self.page == .endpoints and self.endpoints.items.len > 0) self.form = .remove_endpoint;
+                if (self.page == .endpoints and self.endpoints.items.len > 0) {
+                    const endpoint = self.endpoints.items[@min(self.endpoint_index, self.endpoints.items.len - 1)];
+                    if (endpoint.manual and endpoint.sources == null) self.form = .remove_endpoint else self.message = "Discovered endpoint: remove its controller from Services to stop monitoring it.";
+                }
+                if (self.page == .services and self.monitor.controllers.items.len > 0) {
+                    const selected = self.monitor.selected;
+                    self.monitor.selectService(self.service_index);
+                    self.remove_controller_index = self.monitor.selected;
+                    self.monitor.selected = selected;
+                    self.form = .remove_controller;
+                }
                 if (self.form != .none) {
                     self.form_focus = 0;
                     try ctx.requestFocus(self.controls[7].button.widget());
@@ -536,7 +658,34 @@ pub const Dashboard = struct {
     }
 
     fn save(self: *Dashboard, ctx: *vxfw.EventContext) !void {
-        if (self.form == .remove_canary) {
+        if (self.form == .remove_controller) {
+            self.monitor.remove(self.remove_controller_index);
+            try self.reconcileDiscovery();
+        } else if (self.form == .controller) {
+            const name = try self.fields[0].buf.dupe();
+            defer self.allocator.free(name);
+            const url = try self.fields[1].buf.dupe();
+            defer self.allocator.free(url);
+            const conninfo = try self.fields[2].buf.dupe();
+            defer self.allocator.free(conninfo);
+            self.monitor.add(.{ .name = std.mem.trim(u8, name, " "), .url = std.mem.trim(u8, url, " "), .conninfo = conninfo }) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                self.message = "Invalid or duplicate controller. Use a name, HTTP(S) base URL and valid libpq options.";
+                return ctx.consumeAndRedraw();
+            };
+            self.page = .services;
+        } else if (self.form == .filters) {
+            const name = try self.fields[0].buf.dupe();
+            defer self.allocator.free(name);
+            const id = try self.fields[1].buf.dupe();
+            defer self.allocator.free(id);
+            self.monitor.setFilters(id, name) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                self.message = "Filters must be UTF-8 text without control characters.";
+                return ctx.consumeAndRedraw();
+            };
+            self.collection_index = 0;
+        } else if (self.form == .remove_canary) {
             if (self.selectedCanary()) |canary| {
                 try self.runner.removeCanary(canary.id);
                 self.freeCanary(canary);
@@ -545,21 +694,12 @@ pub const Dashboard = struct {
         } else if (self.form == .remove_endpoint) {
             if (self.endpoints.items.len > 0) {
                 self.endpoint_index = @min(self.endpoint_index, self.endpoints.items.len - 1);
-                const endpoint = self.endpoints.items[self.endpoint_index];
-                try self.runner.removeEndpoint(endpoint.id);
-                self.allocator.free(endpoint.name);
-                self.allocator.free(endpoint.conninfo);
-                self.allocator.free(endpoint.label);
-                _ = self.endpoints.orderedRemove(self.endpoint_index);
-                for (self.canaries.items) |*canary| {
-                    _ = canary.observations.remove(endpoint.id);
-                    if (canary.winner == endpoint.id) canary.winner = null;
-                }
+                try self.removeEndpointAt(self.endpoint_index);
             }
-        } else if (self.form == .endpoint or self.form == .canary) {
+        } else if (self.formFieldCount() > 0) {
             var values: [4][]const u8 = @splat("");
             defer for (values) |value| self.allocator.free(value);
-            const count: usize = if (self.form == .endpoint) 2 else 4;
+            const count: usize = self.formFieldCount();
             for (values[0..count], 0..) |*value, i| value.* = try self.fields[i].buf.dupe();
             const name = std.mem.trim(u8, values[0], " \t\r\n");
             const query = std.mem.trim(u8, values[1], " \t\r\n");
@@ -617,7 +757,7 @@ pub const Dashboard = struct {
 
     fn scrollMouse(self: *Dashboard, ctx: *vxfw.EventContext, mouse: vaxis.Mouse) !bool {
         const area = self.list_area;
-        const len = if (self.page == .canaries) self.canaries.items.len else self.endpoints.items.len;
+        const len = self.pageLength();
         const viewport = &self.viewports[@backingInt(self.page)];
         if (self.scrollbar_drag != null and mouse.type == .release) {
             self.scrollbar_drag = null;
@@ -732,6 +872,130 @@ pub const Dashboard = struct {
         }
     }
 
+    fn monitorView(self: *Dashboard, surface: vxfw.Surface, children: *std.ArrayList(vxfw.SubSurface), ctx: vxfw.DrawContext, top: usize, bottom: usize) !void {
+        const w: usize = surface.size.width;
+        const collections = self.page == .collections;
+        text(surface, ctx, 2, top - 1, w - 4, if (collections) "COLLECTIONS" else "SERVICES", self.colors.accent);
+        var y = top;
+        if (collections) {
+            const source = self.monitor.selectedSource();
+            text(surface, ctx, 1, y, w -| 43, try std.fmt.allocPrint(ctx.arena, "{s} [{s}] [h/l]", .{ self.monitor.selectedName(), if (source) |value| if (value.collections_error) "stale / unavailable" else "live" else "unavailable" }), self.colors.accent);
+            if (w >= 60) {
+                try child(children, ctx, self.controls[14].button.widget(), w - 41, y, 14, 1);
+                try child(children, ctx, self.controls[15].button.widget(), w - 26, y, 14, 1);
+                try child(children, ctx, self.controls[16].button.widget(), w - 11, y, 10, 1);
+            }
+            y += 1;
+            text(surface, ctx, 1, y, w - 2, try std.fmt.allocPrint(ctx.arena, "Name LIKE: {s}  ID LIKE: {s}  [/ edit]", .{ self.monitor.name_filter, self.monitor.id_filter }), self.colors.muted);
+            y += 2;
+            text(surface, ctx, 1, y, 13, "ID", self.colors.accent);
+            const name_width = (w -| 18) / 2;
+            text(surface, ctx, 15, y, name_width, "NAME", self.colors.accent);
+            text(surface, ctx, 16 + name_width, y, w -| (17 + name_width), "SINCE (catalog)", self.colors.accent);
+            y += 1;
+        }
+        const row_height: usize = if (collections) 1 else 3;
+        const height = bottom -| y;
+        self.list_area = .{ .x = 1, .y = y, .width = w - 2, .height = height, .row_height = row_height };
+        const capacity = height / row_height;
+        const len = self.pageLength();
+        if (len == 0) {
+            text(surface, ctx, 1, y, w - 2, if (self.monitor.controllers.items.len == 0) "No controllers. Add one with + Controller or c." else if (collections) "No collections (or awaiting controller response)" else "No services", self.colors.muted);
+            return;
+        }
+        if (capacity == 0) return;
+        const index = self.pageIndex();
+        index.* = @min(index.*, len - 1);
+        const viewport = &self.viewports[@backingInt(self.page)];
+        viewport.fit(index.*, len, capacity);
+        const services = if (!collections) try self.monitor.services(ctx.arena) else &.{};
+        const rows = self.monitor.collections();
+        for (viewport.start..@min(len, viewport.start + capacity)) |i| {
+            var label: []const u8 = undefined;
+            var summary: []const u8 = "";
+            if (collections) {
+                label = try std.fmt.allocPrint(ctx.arena, "{s} {s}", .{ if (i == index.*) ">" else " ", rows[i].id });
+            } else {
+                const value = services[i];
+                label = try std.fmt.allocPrint(ctx.arena, "{s} {s}", .{ if (i == index.*) ">" else " ", value.title });
+                summary = try std.fmt.allocPrint(ctx.arena, "{s}\n{s}", .{ value.details, value.addresses });
+            }
+            const item = try self.row(i - viewport.start, self.page, i, label, summary, i == index.*);
+            try child(children, ctx, item.widget(), 1, y + (i - viewport.start) * row_height, w - 4, row_height);
+        }
+        if (len > capacity) {
+            const thumb = @max(@as(usize, 1), height * capacity / len);
+            const thumb_top = viewport.start * (height - thumb) / (len - capacity);
+            for (0..height) |row_y| text(surface, ctx, w - 2, y + row_y, 1, if (row_y >= thumb_top and row_y < thumb_top + thumb) "┃" else "│", if (row_y >= thumb_top and row_y < thumb_top + thumb) self.colors.accent else self.colors.border);
+        }
+    }
+
+    fn reconcileDiscovery(self: *Dashboard) !void {
+        if (!self.monitor.changed or self.form != .none) return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const desired = try self.monitor.destinations(a);
+        var seen = try a.alloc(bool, desired.len);
+        @memset(seen, false);
+        var i: usize = 0;
+        while (i < self.endpoints.items.len) {
+            const endpoint = &self.endpoints.items[i];
+            const key = @import("discovery.zig").canonical(a, endpoint.conninfo) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                i += 1;
+                continue;
+            };
+            var matched = false;
+            for (desired, 0..) |destination, j| if (!seen[j] and std.mem.eql(u8, key, destination.conninfo)) {
+                const sources = try self.allocator.dupe(u8, destination.sources);
+                if (endpoint.sources) |old| self.allocator.free(old);
+                endpoint.sources = sources;
+                if (!endpoint.manual and !std.mem.eql(u8, endpoint.name, destination.sources)) {
+                    const name = try self.allocator.dupe(u8, destination.sources);
+                    self.allocator.free(endpoint.name);
+                    endpoint.name = name;
+                }
+                seen[j] = true;
+                matched = true;
+                break;
+            };
+            if (!matched) {
+                if (endpoint.sources) |old| self.allocator.free(old);
+                endpoint.sources = null;
+                if (!endpoint.manual) {
+                    try self.removeEndpointAt(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        for (desired, seen) |destination, exists| if (!exists) {
+            const previous_selection = self.endpoint_index;
+            try self.addEndpoint(destination.sources, destination.conninfo);
+            const endpoint = &self.endpoints.items[self.endpoints.items.len - 1];
+            endpoint.manual = false;
+            endpoint.sources = try self.allocator.dupe(u8, destination.sources);
+            self.endpoint_index = previous_selection;
+        };
+        self.monitor.changed = false;
+    }
+
+    fn removeEndpointAt(self: *Dashboard, index: usize) !void {
+        const endpoint = self.endpoints.items[index];
+        try self.runner.removeEndpoint(endpoint.id);
+        self.allocator.free(endpoint.name);
+        self.allocator.free(endpoint.conninfo);
+        self.allocator.free(endpoint.label);
+        if (endpoint.sources) |value| self.allocator.free(value);
+        _ = self.endpoints.orderedRemove(index);
+        if (index < self.endpoint_index) self.endpoint_index -= 1;
+        for (self.canaries.items) |*canary| {
+            _ = canary.observations.remove(endpoint.id);
+            if (canary.winner == endpoint.id) canary.winner = null;
+        }
+    }
+
     fn endpointComparison(self: *Dashboard, surface: vxfw.Surface, children: *std.ArrayList(vxfw.SubSurface), ctx: vxfw.DrawContext, top: usize, bottom: usize) !void {
         const width: usize = surface.size.width;
         text(surface, ctx, 2, top - 1, width - 4, if (self.endpoints.items.len == 0) "ENDPOINTS" else try std.fmt.allocPrint(ctx.arena, "ENDPOINTS {d}/{d}  [j/k]", .{ @min(self.endpoint_index + 1, self.endpoints.items.len), self.endpoints.items.len }), self.colors.accent);
@@ -793,19 +1057,21 @@ pub const Dashboard = struct {
         text(surface, ctx, 1, 0, w - 2, "mz-watch", self.colors.accent);
         {
             self.controls[3].button.label = if (self.selectedCanary()) |canary| if (canary.paused) "Resume" else "Pause" else "Pause";
-            const widths = [_]usize{ 13, 11, 9, 9 };
+            const toolbar = [_]struct { index: usize, width: usize }{ .{ .index = 0, .width = 13 }, .{ .index = 1, .width = 11 }, .{ .index = 11, .width = 14 }, .{ .index = 2, .width = 9 }, .{ .index = 3, .width = 9 } };
             var x: usize = 1;
             var y: usize = 2;
-            for (self.controls[0..4], widths) |*control, width| {
-                if (x + width >= w) {
+            for (toolbar) |item| {
+                if (x + item.width >= w) {
                     x = 1;
                     y += 2;
                 }
-                try child(&children, ctx, control.button.widget(), x, y, width, 1);
-                x += width + 1;
+                try child(&children, ctx, self.controls[item.index].button.widget(), x, y, item.width, 1);
+                x += item.width + 1;
             }
             try child(&children, ctx, self.controls[6].button.widget(), w - 8, 0, 7, 1);
-            for ([_]Page{ .canaries, .endpoints }, 4..) |page, i| {
+            const tab_controls = [_]usize{ 4, 5, 12, 13 };
+            var tab_x: usize = 1;
+            for (std.meta.tags(Page), tab_controls) |page, i| {
                 const active = self.page == page;
                 var style = if (active) self.colors.panel else self.colors.selected;
                 style.bold = active;
@@ -814,12 +1080,16 @@ pub const Dashboard = struct {
                 self.controls[i].button.style.hover = style;
                 self.controls[i].button.style.mouse_down = style;
                 self.controls[i].button.style.focus = style;
+                const tab_width: usize = if (w < 60) (w - 4) / 4 else 13;
+                try child(&children, ctx, self.controls[i].button.widget(), tab_x, y + 2, tab_width, 1);
+                tab_x += tab_width + 1;
             }
-            try child(&children, ctx, self.controls[4].button.widget(), 1, y + 2, 13, 1);
-            try child(&children, ctx, self.controls[5].button.widget(), 15, y + 2, 13, 1);
             const top = y + 4;
             const bottom = h - 3;
-            if (self.page == .endpoints) {
+            if (self.page == .services or self.page == .collections) {
+                box(surface, ctx, self.colors, 0, top - 1, w, bottom -| top + 2);
+                try self.monitorView(surface, &children, ctx, top, bottom);
+            } else if (self.page == .endpoints) {
                 box(surface, ctx, self.colors, 0, top - 1, w, bottom -| top + 2);
                 try self.endpointComparison(surface, &children, ctx, top, bottom);
             } else if (w >= 112) {
@@ -839,13 +1109,13 @@ pub const Dashboard = struct {
             }
             const message = if (self.save_error) |err| try std.fmt.allocPrint(ctx.arena, "Configuration not saved: {t}. Changes are session-only.", .{err}) else self.message;
             text(surface, ctx, 1, h - 2, w - 2, message, if (self.save_error != null or self.runner.failed.load(.acquire)) self.colors.danger else self.colors.muted);
-            text(surface, ctx, 1, h - 1, w - 2, "1/2 panels j/k select h/l canary a/e add p pause x remove Tab focus q quit", self.colors.muted);
+            text(surface, ctx, 1, h - 1, w - 2, "1-4 tabs j/k select h/l switch a/e/c add / filter x remove Tab focus q quit", self.colors.muted);
         }
         surface.children = children.items;
         if (self.form != .none) {
             dim(surface, self.colors);
-            const modal_width = @min(w, if (self.form == .remove_endpoint or self.form == .remove_canary) @as(usize, 54) else 94);
-            const modal_height = @min(h, if (self.form == .canary) @as(usize, 18) else 14);
+            const modal_width = @min(w, if (self.isRemoval()) @as(usize, 54) else 94);
+            const modal_height = @min(h, if (self.form == .canary or self.form == .controller) @as(usize, 18) else 14);
             self.modal_area = .{ .x = (w - modal_width) / 2, .y = (h - modal_height) / 2, .width = modal_width, .height = modal_height };
             try child(&children, ctx, self.modalWidget(), self.modal_area.x, self.modal_area.y, modal_width, modal_height);
             surface.children = children.items;
@@ -876,22 +1146,22 @@ pub const Dashboard = struct {
         const h: usize = surface.size.height;
         const width = @min(@as(usize, 90), w - 4);
         const x = (w - width) / 2;
-        const removal = self.form == .remove_endpoint or self.form == .remove_canary;
-        box(surface, ctx, self.colors, x - 1, 1, width + 2, @min(h - 2, if (self.form == .canary) @as(usize, 15) else 11));
-        text(surface, ctx, x, 2, width, if (removal) "Remove selected item?" else if (self.form == .endpoint) "ADD ENDPOINT" else "ADD CANARY", self.colors.accent);
+        const removal = self.isRemoval();
+        box(surface, ctx, self.colors, x - 1, 1, width + 2, @min(h - 2, if (self.form == .canary or self.form == .controller) @as(usize, 15) else 11));
+        text(surface, ctx, x, 2, width, if (removal) "Remove selected item?" else if (self.form == .endpoint) "ADD ENDPOINT" else if (self.form == .controller) "ADD CONTROLLER" else if (self.form == .filters) "COLLECTION FILTERS" else "ADD CANARY", self.colors.accent);
         if (removal) {
-            const name = if (self.form == .remove_canary) (self.selectedCanary() orelse return).name else self.endpoints.items[@min(self.endpoint_index, self.endpoints.items.len - 1)].name;
-            text(surface, ctx, x, 5, width, try std.fmt.allocPrint(ctx.arena, "{s}: {s}", .{ if (self.form == .remove_canary) "Canary" else "Endpoint", name }), self.colors.base);
+            const name = if (self.form == .remove_controller) self.monitor.controllers.items[self.remove_controller_index].saved.name else if (self.form == .remove_canary) (self.selectedCanary() orelse return).name else self.endpoints.items[@min(self.endpoint_index, self.endpoints.items.len - 1)].name;
+            text(surface, ctx, x, 5, width, try std.fmt.allocPrint(ctx.arena, "{s}: {s}", .{ if (self.form == .remove_controller) "Controller (monitoring only)" else if (self.form == .remove_canary) "Canary" else "Endpoint", name }), self.colors.base);
             self.controls[7].button.label = "Remove";
         } else {
             self.controls[7].button.label = "Save";
-            const labels: []const []const u8 = if (self.form == .endpoint) &.{ "Name", "libpq URI / conninfo / service=name (use verify-full for TLS)" } else &.{ "Name", "SQL (one read-only statement)", "Interval (milliseconds)", "Timeout (milliseconds)" };
+            const labels: []const []const u8 = if (self.form == .endpoint) &.{ "Name", "libpq URI / conninfo / service=name (use verify-full for TLS)" } else if (self.form == .controller) &.{ "Name", "Controller HTTP(S) base URL", "SQL libpq options (host/port discovered)" } else if (self.form == .filters) &.{ "Name pattern (SQL LIKE: % any, _ one, backslash escapes)", "ID pattern (both filters must match, empty disables)" } else &.{ "Name", "SQL (one read-only statement)", "Interval (milliseconds)", "Timeout (milliseconds)" };
             for (labels, 0..) |label, i| {
                 text(surface, ctx, x, 3 + i * 2, width, label, self.colors.muted);
                 try child(children, ctx, self.fields[i].widget(), x, 4 + i * 2, width, 1);
             }
         }
-        const button_y: usize = if (removal) 8 else if (self.form == .endpoint) 8 else 12;
+        const button_y: usize = if (removal) 8 else if (self.form == .canary) 12 else if (self.form == .controller) 10 else 8;
         try child(children, ctx, self.controls[7].button.widget(), x, button_y, 12, 1);
         try child(children, ctx, self.controls[8].button.widget(), x + 14, button_y, 12, 1);
         text(surface, ctx, x, @min(button_y + 2, h - 2), width, self.message, self.colors.danger);

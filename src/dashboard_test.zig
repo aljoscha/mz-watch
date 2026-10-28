@@ -162,7 +162,7 @@ test "responsive frames preserve footer and fit both charts at 80x24" {
         .{ .width = 250, .height = 120 },
     };
     for (sizes) |size| {
-        for ([_]@TypeOf(model.page){ .canaries, .endpoints }) |page| {
+        for ([_]@TypeOf(model.page){ .canaries, .endpoints, .services, .collections }) |page| {
             model.page = page;
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
@@ -179,7 +179,7 @@ test "responsive frames preserve footer and fit both charts at 80x24" {
                 var lines = std.mem.splitScalar(u8, rendered, '\n');
                 var footer: []const u8 = "";
                 for (0..size.height) |_| footer = lines.next().?;
-                try std.testing.expect(std.mem.indexOf(u8, footer, "1/2 panels") != null);
+                try std.testing.expect(std.mem.indexOf(u8, footer, "1-4 tabs") != null);
             }
             if (size.width == 80 and page == .canaries) {
                 try std.testing.expect(std.mem.indexOf(u8, rendered, "HISTOGRAM") != null);
@@ -189,4 +189,52 @@ test "responsive frames preserve footer and fit both charts at 80x24" {
             }
         }
     }
+}
+
+test "discovery retains runner identity through controller overlap and failure" {
+    const a = std.testing.allocator;
+    const controller = @import("controller.zig");
+    var runner = api.Runner.init(a, std.testing.io);
+    defer runner.deinit();
+    const model = try a.create(Dashboard);
+    defer a.destroy(model);
+    model.init(a, &runner);
+    defer model.deinit();
+    try model.loadConfiguration(.{
+        .controllers = &.{ .{ .name = "old", .url = "http://localhost:1" }, .{ .name = "new", .url = "http://localhost:2" } },
+        .canaries = &.{.{ .name = "read", .sql = "SELECT 1", .paused = true }},
+    });
+    const snapshot =
+        \\{"generation":1,"adapters":[{"id":"a1","name":"main","generation":1,"service":"a1","endpoints":{"sql-external":["127.0.0.1:6875"]},"observed_processes":[]}],"replicas":[]}
+    ;
+    for (model.monitor.controllers.items) |*source| source.inventory = try controller.parseInventory(a, snapshot);
+    // Exercise the same tick boundary as a background poll without network I/O.
+    model.monitor_started = true;
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = a, .cmds = .empty };
+    defer ctx.cmds.deinit(a);
+    try model.widget().handleEvent(&ctx, .tick);
+    try std.testing.expectEqual(@as(usize, 1), model.endpoints.items.len);
+    const id = model.endpoints.items[0].id;
+    const canary = &model.canaries.items[0];
+    try runner.events.append(a, .{ .sample = .{ .canary = canary.id, .at_ms = 1000, .latency_ms = 12, .winner = id } });
+    try model.widget().handleEvent(&ctx, .tick);
+    try std.testing.expectEqual(@as(u64, 1), canary.stats.successes);
+    model.monitor.controllers.items[0].inventory_error = true;
+    try model.widget().handleEvent(&ctx, .tick);
+    try std.testing.expectEqual(id, model.endpoints.items[0].id);
+    model.monitor.selected = 0;
+    try model.monitor.removeSelected();
+    try model.widget().handleEvent(&ctx, .tick);
+    try std.testing.expectEqual(@as(usize, 1), model.endpoints.items.len);
+    try std.testing.expectEqual(id, model.endpoints.items[0].id);
+    try std.testing.expectEqual(@as(?u64, id), canary.winner);
+    try std.testing.expect(std.mem.indexOf(u8, model.endpoints.items[0].name, "old/") == null);
+    const remaining = &model.monitor.controllers.items[0];
+    remaining.inventory.?.deinit();
+    remaining.inventory = try controller.parseInventory(a, "{\"generation\":1,\"adapters\":[],\"replicas\":[]}");
+    model.monitor.changed = true;
+    try model.widget().handleEvent(&ctx, .tick);
+    try std.testing.expectEqual(@as(usize, 0), model.endpoints.items.len);
+    try std.testing.expectEqual(@as(?u64, null), canary.winner);
+    try std.testing.expectEqual(@as(u64, 1), canary.stats.successes);
 }

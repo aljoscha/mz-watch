@@ -6,6 +6,8 @@ Built with Zig 0.17, libvaxis and libpq.
 ## Build
 
 Install Zig 0.17.0 and libpq development files (`apt install libpq-dev` on Debian/Ubuntu).
+Controller monitoring also requires `curl` on PATH. HTTP polling uses bounded,
+cancelable curl processes, including for DNS resolution and HTTPS verification.
 
 ```sh
 zig build
@@ -61,7 +63,7 @@ view. Mouse-wheel scrolling browses the list without changing the selected
 item. Labels are left-aligned, with status summaries and faint separators.
 Click a row or endpoint card to select it, or click and drag the scrollbar to
 browse. Removal targets the selected item, not the first visible item.
-The two tabs retain their own scroll positions within the session.
+The tabs retain their own scroll positions within the session.
 
 Light mode is the default, with pale backgrounds, bordered panels and teal
 accents. A terminal color-scheme report switches the palette automatically.
@@ -72,11 +74,53 @@ The Endpoints tab shows multiple cards at both 80x24 and wider sizes.
 Smaller terminals keep controls and measurements accessible, hiding charts when
 there is not enough room.
 
-There is no automatic endpoint discovery, failover policy, or process control.
+## Controllers, services and collections
+
+Add a controller with `c` or **+ Controller**. Give it a name, HTTP(S) base URL
+(for example `http://127.0.0.1:6882`) and shared libpq options for its adapters
+(default `user=materialize dbname=materialize`). Add both old and new controllers
+during an upgrade. Each controller polls independently, approximately once per
+second. Slow or unavailable controllers do not block the UI or other controllers.
+Controller HTTP is read-only and has no built-in authentication. Protect remote
+access outside controllerd, such as through a trusted tunnel.
+
+**Services** (`3`) groups adapters, replicas and pubsub under each controller.
+It shows deployment generation, observed process status, restart counts,
+provisioning errors and labeled addresses. Adapter SQL readiness is distinct
+from process status. `online` is not a SQL-readiness guarantee. Select any row
+in a controller group and press `x` to remove that controller from monitoring.
+This never stops processes or changes controllerd state.
+
+**Collections** (`4`) shows ID, qualified name and committed catalog since for
+one controller at a time. `h`/`l` and the header buttons select the controller.
+Press `/` or **Filter** to apply name and/or ID patterns. These are case-sensitive
+SQL LIKE patterns: `%` matches any sequence, `_` one character and backslash
+escapes literals. Both filters must match. Empty fields disable that filter.
+A name filter excludes unnamed entries. Applied filters and controller selection
+are saved. New filters clear the previous result until a matching response arrives.
+`unknown` means the frontier is unavailable, while `[]` means an empty frontier.
+Since is the committed combined catalog frontier, not physical Persist since.
+Inspection works without a serving SQL adapter and acquires no read holds.
+
+Adapters advertising **sql-external** automatically join the Endpoints tab and
+canary races, labeled with their controller, generation and adapter identity.
+Host and port come from inventory, overriding those in the shared libpq options.
+Other listener names remain visible in Services but are not guessed as SQL targets.
+Readiness does not gate canary attempts. Identical destinations with identical
+explicit libpq options are queried once even when multiple controllers advertise
+them. Discovery does not resolve DNS aliases or expand service files to identify
+equivalent destinations.
+
+Failed polls retain the last good inventory and SQL endpoints, marked stale.
+Successful inventory removal, or removing its last advertising controller, removes
+a discovered destination. Shared destinations retain their measurements while
+at least one controller advertises them. Discovered addresses are not saved to
+configuration and cannot be removed individually. Manually added endpoints remain
+independent. There is no automated failover policy or process control.
 
 ## Configuration
 
-Endpoints and canaries load on startup. Adding, removing, pausing or resuming
+Controllers, manual endpoints and canaries load on startup. Adding, removing, pausing or resuming
 items automatically saves `~/.config/mz-watch/config.zon`, or
 `$XDG_CONFIG_HOME/mz-watch/config.zon` when that variable is an absolute path.
 Measurements reset each session. Files are atomically replaced with permissions
@@ -86,6 +130,13 @@ The format is ZON, supported by Zig's standard library. For example:
 
 ```zig
 .{
+    .controllers = .{
+        .{ .name = "blue", .url = "http://127.0.0.1:6882", .conninfo = "user=materialize dbname=materialize" },
+        .{ .name = "green", .url = "http://127.0.0.1:7882", .conninfo = "user=materialize dbname=materialize" },
+    },
+    .collections_controller = "http://127.0.0.1:6882",
+    .collection_id_filter = "u%",
+    .collection_name_filter = "",
     .endpoints = .{
         .{ .name = "local", .conninfo = "service=demo" },
     },
@@ -171,3 +222,12 @@ Use a disposable Materialize or PostgreSQL endpoint. The test exercises mouse
 buttons, forms, real SQL samples, both charts, every endpoint/canary pair, light
 and dark palettes, resize, pause, removal, persistence across restarts and save
 failure recovery. Its configuration is isolated in a temporary directory.
+
+The controller-only terminal harness needs no running Materialize instance:
+
+```sh
+python scripts/controller-smoke.py
+```
+
+It uses isolated local HTTP fixtures to exercise multi-controller discovery,
+collection filtering and persistence, stale inventory, deduplication and removal.
