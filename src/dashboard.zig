@@ -442,7 +442,7 @@ pub const Dashboard = struct {
         } else if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
             var actions: std.ArrayList(Action) = .empty;
             defer actions.deinit(self.allocator);
-            try actions.appendSlice(self.allocator, &.{ .add_endpoint, .add_canary, .add_controller, .remove, .pause, .show_canaries, .show_endpoints, .show_services, .show_collections, .quit });
+            try actions.appendSlice(self.allocator, &.{ .add_canary, .add_endpoint, .add_controller, .remove, .pause, .show_canaries, .show_endpoints, .show_services, .show_collections, .quit });
             if (self.page == .endpoints and self.canaries.items.len > 0) try actions.appendSlice(self.allocator, &.{ .prev_canary, .next_canary });
             if (self.page == .collections) try actions.appendSlice(self.allocator, &.{ .prev_controller, .next_controller, .filter });
             const toolbar_actions = actions.items;
@@ -1057,7 +1057,7 @@ pub const Dashboard = struct {
         text(surface, ctx, 1, 0, w - 2, "mz-watch", self.colors.accent);
         {
             self.controls[3].button.label = if (self.selectedCanary()) |canary| if (canary.paused) "Resume" else "Pause" else "Pause";
-            const toolbar = [_]struct { index: usize, width: usize }{ .{ .index = 0, .width = 13 }, .{ .index = 1, .width = 11 }, .{ .index = 11, .width = 14 }, .{ .index = 2, .width = 9 }, .{ .index = 3, .width = 9 } };
+            const toolbar = [_]struct { index: usize, width: usize }{ .{ .index = 1, .width = 11 }, .{ .index = 0, .width = 13 }, .{ .index = 11, .width = 14 }, .{ .index = 2, .width = 9 }, .{ .index = 3, .width = 9 } };
             var x: usize = 1;
             var y: usize = 2;
             for (toolbar) |item| {

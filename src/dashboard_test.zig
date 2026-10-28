@@ -181,6 +181,12 @@ test "responsive frames preserve footer and fit both charts at 80x24" {
                 for (0..size.height) |_| footer = lines.next().?;
                 try std.testing.expect(std.mem.indexOf(u8, footer, "1-4 tabs") != null);
             }
+            if (size.width >= 74 and size.height >= 24) {
+                const canary_button = std.mem.indexOf(u8, rendered, "+ Canary").?;
+                const endpoint_button = std.mem.indexOf(u8, rendered, "+ Endpoint").?;
+                const controller_button = std.mem.indexOf(u8, rendered, "+ Controller").?;
+                try std.testing.expect(canary_button < endpoint_button and endpoint_button < controller_button);
+            }
             if (size.width == 80 and page == .canaries) {
                 try std.testing.expect(std.mem.indexOf(u8, rendered, "HISTOGRAM") != null);
                 try std.testing.expect(std.mem.indexOf(u8, rendered, "MEAN / SECOND") != null);
