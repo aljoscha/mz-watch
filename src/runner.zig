@@ -2,10 +2,11 @@ const std = @import("std");
 const pq = @import("pq.zig");
 
 pub const Id = u64;
+pub const Outcome = @import("metrics.zig").Outcome;
 pub const Status = enum { connecting, ready, running, success, query_error, connection_error, timeout, busy, unavailable };
 
 pub const Event = union(enum) {
-    sample: struct { canary: Id, at_ms: i64, latency_ms: ?f64, winner: ?Id },
+    sample: struct { canary: Id, at_ms: i64, outcome: Outcome, winner: ?Id },
     endpoint: struct { canary: Id, endpoint: Id, status: Status, latency_ms: ?f64 = null, sqlstate: [5]u8 = @splat(' ') },
 };
 
@@ -245,7 +246,7 @@ const State = struct {
         const latency: f64 = @as(f64, @floatFromInt(now - race.started_ns)) / std.time.ns_per_ms;
         // A winner is published immediately, independently of losing requests.
         if (status == .success and !race.won) {
-            try self.runner.emit(.{ .sample = .{ .canary = canary.config.id, .at_ms = @divFloor(now, std.time.ns_per_ms), .latency_ms = latency, .winner = slot.endpoint } });
+            try self.runner.emit(.{ .sample = .{ .canary = canary.config.id, .at_ms = @divFloor(now, std.time.ns_per_ms), .outcome = .{ .success = latency }, .winner = slot.endpoint } });
             race.won = true;
         }
         try self.report(canary, slot, status, if (status == .success) latency else null);
@@ -253,7 +254,7 @@ const State = struct {
         race.remaining -= 1;
         if (race.remaining == 0) {
             defer self.runner.allocator.destroy(race);
-            if (!race.won) try self.runner.emit(.{ .sample = .{ .canary = canary.config.id, .at_ms = @divFloor(now, std.time.ns_per_ms), .latency_ms = null, .winner = null } });
+            if (!race.won) try self.runner.emit(.{ .sample = .{ .canary = canary.config.id, .at_ms = @divFloor(now, std.time.ns_per_ms), .outcome = .{ .failure = latency }, .winner = null } });
         }
     }
 
@@ -291,7 +292,7 @@ const State = struct {
             }
         }
         if (available == 0) {
-            try self.runner.emit(.{ .sample = .{ .canary = canary.config.id, .at_ms = @divFloor(now, std.time.ns_per_ms), .latency_ms = null, .winner = null } });
+            try self.runner.emit(.{ .sample = .{ .canary = canary.config.id, .at_ms = @divFloor(now, std.time.ns_per_ms), .outcome = .skipped, .winner = null } });
             return;
         }
         const race = try self.runner.allocator.create(Race);

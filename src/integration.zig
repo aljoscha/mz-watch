@@ -36,6 +36,19 @@ const Harness = struct {
     fn collect(self: *Harness) !void {
         var batch = self.runner.takeEvents();
         defer batch.deinit(self.allocator);
+        for (batch.items) |event| switch (event) {
+            .sample => |sample| {
+                switch (sample.outcome) {
+                    .success, .failure => |duration| {
+                        try expect(std.math.isFinite(duration) and duration >= 0, "completed races carry a finite nonnegative duration");
+                        try expect((sample.winner != null) == (sample.outcome == .success), "only successful races have a winner");
+                    },
+                    .skipped => try expect(sample.winner == null, "durationless skipped schedules have no winner"),
+                }
+                try expect(sample.at_ms > 0 and sample.at_ms <= @divFloor(nowNs(self.io), std.time.ns_per_ms), "sample timestamp is an actual observation time");
+            },
+            .endpoint => |endpoint| try expect((endpoint.latency_ms != null) == (endpoint.status == .success), "only successful endpoint observations carry latency"),
+        };
         try self.events.appendSlice(self.allocator, batch.items);
     }
 
@@ -72,11 +85,9 @@ const Harness = struct {
         while (nowNs(self.io) < until) {
             try self.collect();
             for (self.events.items, 0..) |event, i| switch (event) {
-                .sample => |s| if (s.canary == canary) {
+                .sample => |s| if (s.canary == canary and s.outcome != .skipped) {
                     try expect(s.winner == winner, "sample has the expected winner");
-                    try expect((s.latency_ms != null) == (winner != null), "only successful samples carry latency");
-                    if (s.latency_ms) |latency| try expect(std.math.isFinite(latency) and latency >= 0, "measured latency is finite and nonnegative");
-                    try expect(s.at_ms > 0 and s.at_ms <= @divFloor(nowNs(self.io), std.time.ns_per_ms), "sample timestamp is an actual observation time");
+                    try expect(if (winner != null) s.outcome == .success else s.outcome == .failure, "waitSample waits for an actual completed race");
                     return i;
                 },
                 else => {},
@@ -95,6 +106,17 @@ const Harness = struct {
         var count: usize = 0;
         for (self.events.items) |event| switch (event) {
             .sample => count += 1,
+            else => {},
+        };
+        return count;
+    }
+
+    fn countOutcome(self: *Harness, outcome: std.meta.Tag(api.Outcome)) usize {
+        var count: usize = 0;
+        for (self.events.items) |event| switch (event) {
+            .sample => |s| if (s.canary == canary and std.meta.activeTag(s.outcome) == outcome) {
+                count += 1;
+            },
             else => {},
         };
         return count;
@@ -164,7 +186,7 @@ fn firstSuccess(a: std.mem.Allocator, io: std.Io, conninfo: []const u8) !void {
     try expect(sample < loser, "winner publication precedes losing completion");
     const count = h.samples();
     try h.quiet(1_000);
-    try expect(h.samples() == count and count == 1, "pause permits in-flight completion without another sample");
+    try expect(h.samples() == count and h.countOutcome(.success) == 1 and h.countOutcome(.failure) == 0, "pause permits in-flight completion without another sample");
     std.debug.print("PASS: early winner, losing visibility, in-flight pause\n", .{});
 }
 
@@ -177,7 +199,7 @@ fn concurrentQueries(a: std.mem.Allocator, io: std.Io, conninfo: []const u8, obs
     try observer.waitFor(&h, "SELECT count(*) = 2 FROM pg_stat_activity WHERE application_name IN ('fast', 'slow') AND state = 'active' AND wait_event = 'PgSleep' AND query LIKE '%mz_watch_overlap%'");
     _ = try h.waitStatus(fast, .success);
     _ = try h.waitStatus(slow, .success);
-    try expect(h.samples() == 1, "concurrent successes publish exactly one winner");
+    try expect(h.countOutcome(.success) == 1 and h.countOutcome(.failure) == 0, "concurrent successes publish exactly one winner and no failure");
     std.debug.print("PASS: both canary queries execute concurrently on the server\n", .{});
 }
 
@@ -189,7 +211,35 @@ fn errors(a: std.mem.Allocator, io: std.Io, conninfo: []const u8, observer: Obse
         const failed = try h.waitStatus(fast, .query_error);
         const sample = try h.waitSample(slow);
         try expect(failed < sample, "an earlier error never wins over a later success");
+        try expect(h.countOutcome(.success) == 1 and h.countOutcome(.failure) == 0, "an early failed endpoint adds no failed race when its peer succeeds");
         try expect(std.mem.eql(u8, &h.events.items[failed].endpoint.sqlstate, "22012"), "real division error SQLSTATE is preserved");
+    }
+    {
+        var h = Harness.init(a, io);
+        defer h.deinit();
+        try h.prepare(conninfo, "SELECT 1 / (CASE current_setting('application_name') WHEN 'fast' THEN 1 ELSE 0 END + length(slept::text) * 0) FROM pg_sleep(CASE current_setting('application_name') WHEN 'fast' THEN 0.1 ELSE 1 END) AS slept", 60_000, 10_000, true);
+        const sample = try h.waitSample(fast);
+        const failed = try h.waitStatus(slow, .query_error);
+        try expect(sample < failed, "winner is published before the losing endpoint fails");
+        // Endpoint completion and race publication are separate observations.
+        try h.quiet(100);
+        try expect(h.countOutcome(.success) == 1 and h.countOutcome(.failure) == 0, "a late failed loser adds no failed race");
+    }
+    {
+        var h = Harness.init(a, io);
+        defer h.deinit();
+        // The denominator depends on the function result so the server sleeps
+        // before raising the error, rather than rejecting a constant at plan time.
+        try h.prepare(conninfo, "SELECT 1 / (length(slept::text) * 0) FROM pg_sleep(CASE current_setting('application_name') WHEN 'fast' THEN 1 ELSE 3 END) AS slept /* mz_watch_all_fail */", 60_000, 10_000, true);
+        const first = try h.waitStatus(fast, .query_error);
+        try observer.waitFor(&h, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = 'slow' AND state = 'active' AND wait_event = 'PgSleep' AND query LIKE '%mz_watch_all_fail%')");
+        try h.collect();
+        try expect(h.countOutcome(.failure) == 0, "the first endpoint error does not publish a failed race");
+        const last = try h.waitStatus(slow, .query_error);
+        const sample = try h.waitSample(null);
+        try expect(first < last and last < sample, "failed race is published only after its last participant finishes");
+        try expect(h.events.items[sample].sample.outcome.failure >= 2_900, "failed race duration includes the last endpoint's server sleep from race start");
+        try expect(h.countOutcome(.failure) == 1 and h.countOutcome(.success) == 0, "all-failed race publishes exactly one failure");
     }
     const cases = [_]struct { sql: []const u8, state: []const u8 }{
         .{ .sql = "SELECT 1 / (length(current_setting('application_name')) - length(current_setting('application_name')))", .state = "22012" },
@@ -204,6 +254,7 @@ fn errors(a: std.mem.Allocator, io: std.Io, conninfo: []const u8, observer: Obse
         const s = try h.waitStatus(slow, .query_error);
         const sample = try h.waitSample(null);
         try expect(sample > f and sample > s, "all-failed sample follows both failures");
+        try expect(h.countOutcome(.failure) == 1 and h.countOutcome(.success) == 0, "rejected SQL produces exactly one failed race");
         try expect(std.mem.eql(u8, &h.events.items[f].endpoint.sqlstate, case.state) and std.mem.eql(u8, &h.events.items[s].endpoint.sqlstate, case.state), "both endpoints report the expected SQLSTATE");
         try expect(h.statusIndex(fast, .success) == null and h.statusIndex(slow, .success) == null, "rejected SQL produces no success");
     }
@@ -223,7 +274,10 @@ fn timeouts(a: std.mem.Allocator, io: std.Io, conninfo: []const u8) !void {
     const tf = try h.waitStatus(fast, .timeout);
     const ts = try h.waitStatus(slow, .timeout);
     try expect(bf < tf and bs < ts, "busy ticks are skipped before explicit request deadlines");
-    _ = try h.waitSample(null);
+    const sample = try h.waitSample(null);
+    try expect(sample > tf and sample > ts, "timeout failure follows both participating endpoints' deadlines");
+    try expect(h.events.items[sample].sample.outcome.failure >= 1_499, "timeout duration reaches the configured deadline allowing millisecond rounding");
+    try expect(h.countOutcome(.skipped) > 0 and h.countOutcome(.failure) == 1 and h.countOutcome(.success) == 0, "busy schedules are durationless skips, separate from the one timed-out race");
     h.events.clearRetainingCapacity();
     _ = try h.waitStatus(fast, .ready);
     _ = try h.waitStatus(slow, .ready);
@@ -245,18 +299,22 @@ fn skippedSchedules(a: std.mem.Allocator, io: std.Io, conninfo: []const u8) !voi
         try h.tick();
         for (h.events.items[cursor..]) |event| switch (event) {
             .sample => |s| {
-                if (s.winner == null) {
-                    if (successes == 0) skipped_at = s.at_ms;
-                    continue;
-                }
+                const latency = switch (s.outcome) {
+                    .skipped => {
+                        if (successes == 0) skipped_at = s.at_ms;
+                        continue;
+                    },
+                    .failure => return error.UnexpectedFailedRace,
+                    .success => |duration| duration,
+                };
                 successes += 1;
                 if (successes != 2) continue;
                 try expect(skipped_at != null, "a schedule tick was skipped while all endpoints were busy");
-                try expect(s.latency_ms != null, "successful sample carries the measured duration");
+                try expect(h.countOutcome(.failure) == 0, "busy skips do not count as failed queries");
                 // A completed request must not release a queued missed tick.
                 // Infer the next race's start from public timestamp and latency,
                 // allowing only rounding of the integer millisecond timestamp.
-                const next_start = @as(f64, @floatFromInt(s.at_ms)) - s.latency_ms.?;
+                const next_start = @as(f64, @floatFromInt(s.at_ms)) - latency;
                 try expect(next_start + 2 >= @as(f64, @floatFromInt(skipped_at.? + interval)), "missed ticks are not replayed immediately after completion");
                 std.debug.print("PASS: busy schedules do not replay as a catch-up burst\n", .{});
                 return;
@@ -268,6 +326,23 @@ fn skippedSchedules(a: std.mem.Allocator, io: std.Io, conninfo: []const u8) !voi
     return error.DeadlineExceeded;
 }
 
+fn unavailableSchedules(a: std.mem.Allocator, io: std.Io) !void {
+    var h = Harness.init(a, io);
+    defer h.deinit();
+    // A character device cannot contain a PostgreSQL socket. Connection failure
+    // leaves a configured but unavailable slot without starting a query race.
+    try h.runner.addEndpoint(fast, "host=/dev/null dbname=mz_watch_unavailable connect_timeout=1");
+    try h.runner.addCanary(canary, "SELECT 1", 100, 1_000);
+    try h.runner.start();
+    _ = try h.waitStatus(fast, .connection_error);
+    _ = try h.waitStatus(fast, .unavailable);
+    const until = h.deadline();
+    while (h.countOutcome(.skipped) == 0 and nowNs(io) < until) try h.tick();
+    try expect(h.countOutcome(.skipped) > 0, "a scheduled query with no ready endpoints emits a durationless skip");
+    try expect(h.countOutcome(.success) == 0 and h.countOutcome(.failure) == 0, "unavailable schedules do not invent completed query samples");
+    std.debug.print("PASS: unavailable schedules are skips, not failed queries\n", .{});
+}
+
 fn connectionLoss(a: std.mem.Allocator, io: std.Io, conninfo: []const u8, observer: Observer) !void {
     var h = Harness.init(a, io);
     defer h.deinit();
@@ -277,6 +352,7 @@ fn connectionLoss(a: std.mem.Allocator, io: std.Io, conninfo: []const u8, observ
     _ = try h.waitStatus(fast, .connection_error);
     _ = try h.waitSample(slow);
     try expect(h.statusIndex(fast, .success) == null, "disconnected endpoint never reports success");
+    try expect(h.countOutcome(.success) == 1 and h.countOutcome(.failure) == 0, "connection loss adds no failed race when a peer succeeds");
     const recovered = try h.waitStatus(fast, .ready);
     try expect(recovered > h.statusIndex(fast, .connection_error).?, "failed endpoint reconnects");
     std.debug.print("PASS: healthy endpoint wins after in-flight peer loss; failed peer reconnects\n", .{});
@@ -354,6 +430,7 @@ pub fn main(init: std.process.Init) !void {
     try errors(a, init.io, conninfo, observer);
     try timeouts(a, init.io, conninfo);
     try skippedSchedules(a, init.io, conninfo);
+    try unavailableSchedules(a, init.io);
     try connectionLoss(a, init.io, conninfo, observer);
     try lifecycle(a, init.io, conninfo, observer);
     std.debug.print("PASS: PostgreSQL integration contracts\n", .{});

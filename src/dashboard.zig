@@ -360,7 +360,7 @@ pub const Dashboard = struct {
             .sample => |sample| {
                 const i = self.canaryIndex(sample.canary) orelse continue;
                 const canary = &self.canaries.items[i];
-                canary.stats.record(sample.at_ms, sample.latency_ms);
+                canary.stats.record(sample.at_ms, sample.outcome);
                 canary.winner = if (sample.winner) |id| if (self.endpointIndex(id) != null) id else null else null;
                 if (canary.winner) |id| {
                     const record = try canary.observations.getOrPut(self.allocator, id);
@@ -852,8 +852,8 @@ pub const Dashboard = struct {
         text(surface, ctx, x, y, width, try std.fmt.allocPrint(ctx.arena, "Canary: {s}  {s}", .{ canary.name, if (canary.paused) "[paused]" else "[live]" }), self.colors.accent);
         text(surface, ctx, x, y + 1, width, canary.sql, self.colors.muted);
         text(surface, ctx, x, y + 2, width, try std.fmt.allocPrint(ctx.arena, "Every {d}ms  /  deadline {d}ms  /  {d} endpoints", .{ canary.interval_ms, canary.timeout_ms, self.endpoints.items.len }), self.colors.muted);
-        const mean = if (canary.stats.mean(now)) |value| try std.fmt.allocPrint(ctx.arena, "{d:.2}ms", .{value}) else "no samples";
-        text(surface, ctx, x, y + 3, width, try std.fmt.allocPrint(ctx.arena, "OK {d}  FAIL {d}  Mean (60s) {s}", .{ canary.stats.successes, canary.stats.failures, mean }), self.colors.base);
+        const mean = if (canary.stats.mean(now, .success)) |value| try std.fmt.allocPrint(ctx.arena, "{d:.2}ms", .{value}) else "no samples";
+        text(surface, ctx, x, y + 3, width, try std.fmt.allocPrint(ctx.arena, "OK {d}  FAIL {d}  SKIP {d}  Mean OK (60s) {s}", .{ canary.stats.successes, canary.stats.failures, canary.stats.skipped, mean }), self.colors.base);
         const winner = if (canary.winner) |id| if (self.endpointIndex(id)) |i| self.endpoints.items[i].name else "removed" else "none";
         text(surface, ctx, x, y + 4, width, try std.fmt.allocPrint(ctx.arena, "Last winner: {s}", .{winner}), self.colors.accent);
         if (height < 11 or width < 36 or (width < 75 and height < 16)) {
@@ -1244,33 +1244,56 @@ fn text(surface: vxfw.Surface, ctx: vxfw.DrawContext, x: usize, y: usize, width:
 }
 
 fn histogram(surface: vxfw.Surface, ctx: vxfw.DrawContext, colors: Palette, stats: *const metrics.Stats, now: i64, x: usize, y: usize, width: usize, height: usize) !void {
-    const bins = stats.histogram(now);
-    var peak: u64 = 1;
-    for (bins) |count| peak = @max(peak, count);
+    if (width == 0 or height == 0) return;
+    const successes = stats.histogram(now, .success);
+    const failures = stats.histogram(now, .failure);
+    var peak: u128 = 1;
+    for (successes, failures) |ok, fail| peak = @max(peak, @as(u128, ok) + fail);
     text(surface, ctx, x, y, width, try std.fmt.allocPrint(ctx.arena, "HISTOGRAM 60s  peak {d}", .{peak}), colors.muted);
     const stride = @max(@as(usize, 1), width / 12);
-    for (bins, 0..) |count, i| {
-        const n: usize = @intCast((count * height + peak - 1) / peak);
-        for (0..n) |row_y| text(surface, ctx, x + i * stride, y + height - row_y, @max(@as(usize, 1), stride -| 1), "██", colors.accent);
+    for (successes, failures, 0..) |ok, fail, i| {
+        const total = @as(u128, ok) + fail;
+        if (total == 0) continue;
+        const n: usize = @intCast((total * height + peak - 1) / peak);
+        const bar_width = @max(@as(usize, 1), stride -| 1);
+        if (n == 1 and ok > 0 and fail > 0) {
+            // Two colors in one terminal cell keep a small mixed bin visible.
+            var mixed = colors.danger;
+            mixed.bg = colors.accent.fg;
+            text(surface, ctx, x + i * stride, y + height, bar_width, "▀▀", mixed);
+            continue;
+        }
+        const ok_height: usize = if (ok == 0) 0 else if (fail == 0) n else @intCast(@max(1, @min(n - 1, (@as(u128, ok) * n + total / 2) / total)));
+        for (0..n) |row_y| text(surface, ctx, x + i * stride, y + height - row_y, bar_width, "██", if (row_y < ok_height) colors.accent else colors.danger);
     }
     const labels = [_][]const u8{ "1", "2", "5", "10", "20", "50", ".1s", ".2s", ".5s", "1s", "5s", ">5s" };
     for (labels, 0..) |label, i| text(surface, ctx, x + i * stride, y + height + 1, stride, label, colors.muted);
-    text(surface, ctx, x, y + height + 2, width, "Inclusive upper bounds (ms unless marked s)", colors.muted);
+    text(surface, ctx, x, y + height + 2, @min(width, 6), "■ OK", colors.accent);
+    if (width > 6) text(surface, ctx, x + 6, y + height + 2, @min(width - 6, 8), "■ FAIL", colors.danger);
+    if (width > 14) text(surface, ctx, x + 14, y + height + 2, width - 14, "≤ ms / s", colors.muted);
 }
 
 fn timeline(surface: vxfw.Surface, ctx: vxfw.DrawContext, colors: Palette, stats: *const metrics.Stats, now: i64, x: usize, y: usize, width: usize, height: usize) !void {
-    const series = stats.series(now);
+    if (width == 0 or height == 0) return;
+    const successes = stats.series(now, .success);
+    const failures = stats.series(now, .failure);
     var peak: f64 = 1;
-    for (series) |value| if (value) |n| {
-        peak = @max(peak, n);
+    for ([_][60]?f64{ successes, failures }) |series| for (series) |value| {
+        if (value) |n| peak = @max(peak, n);
     };
     text(surface, ctx, x, y, width, try std.fmt.allocPrint(ctx.arena, "MEAN / SECOND  top {d:.1}ms", .{peak}), colors.muted);
-    for (series, 0..) |value, i| {
+    for ([_][60]?f64{ successes, failures }, 0..) |series, channel| for (series, 0..) |value, i| {
         const n = value orelse continue;
         const row: usize = @intFromFloat(@round(n / peak * @as(f64, @floatFromInt(height - 1))));
-        text(surface, ctx, x + i * (width - 1) / 59, y + height - row, 1, "•", colors.accent);
-    }
+        const col = x + i * (width - 1) / 59;
+        const point_y = y + height - row;
+        const previous = surface.readCell(col, point_y).char.grapheme;
+        const overlap = channel == 1 and (std.mem.eql(u8, previous, "•") or std.mem.eql(u8, previous, "⊗"));
+        text(surface, ctx, col, point_y, 1, if (overlap) "⊗" else if (channel == 0) "•" else "×", if (overlap) colors.base else if (channel == 0) colors.accent else colors.danger);
+    };
     text(surface, ctx, x, y + height + 1, width, "-59s", colors.muted);
     text(surface, ctx, x + width -| 3, y + height + 1, 3, "now", colors.muted);
-    text(surface, ctx, x, y + height + 2, width, "Gaps = no successful samples", colors.muted);
+    text(surface, ctx, x, y + height + 2, @min(width, 6), "• OK", colors.accent);
+    if (width > 6) text(surface, ctx, x + 6, y + height + 2, @min(width - 6, 8), "× FAIL", colors.danger);
+    if (width > 14) text(surface, ctx, x + 14, y + height + 2, width - 14, "⊗ both", colors.base);
 }

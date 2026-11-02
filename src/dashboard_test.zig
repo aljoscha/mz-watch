@@ -154,7 +154,7 @@ test "responsive frames preserve footer and fit both charts at 80x24" {
     const model = try fixture(a, &runner);
     defer a.destroy(model);
     defer model.deinit();
-    model.canaries.items[0].stats.record(@divFloor(api.nowNs(std.testing.io), std.time.ns_per_ms), 20);
+    model.canaries.items[0].stats.record(@divFloor(api.nowNs(std.testing.io), std.time.ns_per_ms), .{ .success = 20 });
     const sizes = [_]vxfw.Size{
         .{ .width = 0, .height = 0 },     .{ .width = 1, .height = 1 },    .{ .width = 20, .height = 8 },
         .{ .width = 35, .height = 15 },   .{ .width = 74, .height = 24 },  .{ .width = 80, .height = 24 },
@@ -222,7 +222,7 @@ test "discovery retains runner identity through controller overlap and failure" 
     try std.testing.expectEqual(@as(usize, 1), model.endpoints.items.len);
     const id = model.endpoints.items[0].id;
     const canary = &model.canaries.items[0];
-    try runner.events.append(a, .{ .sample = .{ .canary = canary.id, .at_ms = 1000, .latency_ms = 12, .winner = id } });
+    try runner.events.append(a, .{ .sample = .{ .canary = canary.id, .at_ms = 1000, .outcome = .{ .success = 12 }, .winner = id } });
     try model.widget().handleEvent(&ctx, .tick);
     try std.testing.expectEqual(@as(u64, 1), canary.stats.successes);
     model.monitor.controllers.items[0].inventory_error = true;
@@ -243,4 +243,69 @@ test "discovery retains runner identity through controller overlap and failure" 
     try std.testing.expectEqual(@as(usize, 0), model.endpoints.items.len);
     try std.testing.expectEqual(@as(?u64, null), canary.winner);
     try std.testing.expectEqual(@as(u64, 1), canary.stats.successes);
+}
+
+fn labelPosition(rendered: []const u8, label: []const u8, ctx: vxfw.DrawContext) !struct { x: usize, y: usize } {
+    var lines = std.mem.splitScalar(u8, rendered, '\n');
+    var y: usize = 0;
+    while (lines.next()) |line| : (y += 1) {
+        if (std.mem.indexOf(u8, line, label)) |offset| return .{ .x = ctx.stringWidth(line[0..offset]), .y = y };
+    }
+    return error.MissingChartLabel;
+}
+
+test "charts distinguish failures, successes and overlap while skipped runs have no points" {
+    const a = std.testing.allocator;
+    var runner = api.Runner.init(a, std.testing.io);
+    defer runner.deinit();
+    const model = try fixture(a, &runner);
+    defer a.destroy(model);
+    defer model.deinit();
+    const now = @divFloor(api.nowNs(std.testing.io), std.time.ns_per_ms);
+    const stats = &model.canaries.items[0].stats;
+    stats.record(now - 5_000, .{ .success = 20 });
+    stats.record(now - 4_000, .{ .failure = 200 });
+    stats.record(now - 2_000, .{ .success = 10 });
+    stats.record(now - 2_000, .{ .failure = 10 });
+    stats.record(now - 1_000, .skipped);
+    for ([_]vxfw.Size{ .{ .width = 80, .height = 24 }, .{ .width = 120, .height = 32 } }) |size| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const ctx = context(arena.allocator(), size);
+        const frame = try model.widget().draw(ctx);
+        const rendered = try frameText(a, frame);
+        defer a.free(rendered);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "OK 2  FAIL 2  SKIP 1  Mean OK (60s) 15.00ms") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "MEAN / SECOND  top 200.0ms") != null);
+        const hist = try labelPosition(rendered, "HISTOGRAM", ctx);
+        const mean = try labelPosition(rendered, "MEAN / SECOND", ctx);
+        const axis = try labelPosition(rendered, "-59s", ctx);
+        const cells = try arena.allocator().alloc(@import("vaxis").Cell, @as(usize, size.width) * size.height);
+        @memset(cells, .{});
+        paint(frame, cells, size, 0, 0);
+        var success_point = false;
+        var failure_point = false;
+        var overlap_point = false;
+        var success_bar = false;
+        var failure_bar = false;
+        const hist_bottom = if (hist.y == mean.y) axis.y else mean.y - 1;
+        const hist_end = if (hist.y == mean.y) mean.x else size.width - 1;
+        for (cells, 0..) |cell, i| {
+            const x = i % size.width;
+            const y = i / size.width;
+            if (x >= mean.x and y > mean.y and y < axis.y) {
+                if (std.mem.eql(u8, cell.char.grapheme, "•") and cell.style.fg.eql(model.colors.accent.fg)) success_point = true;
+                if (std.mem.eql(u8, cell.char.grapheme, "×") and cell.style.fg.eql(model.colors.danger.fg)) failure_point = true;
+                if (std.mem.eql(u8, cell.char.grapheme, "⊗")) overlap_point = true;
+            }
+            if (x >= hist.x and x < hist_end and y > hist.y and y < hist_bottom) {
+                if (std.mem.eql(u8, cell.char.grapheme, "█")) {
+                    if (cell.style.fg.eql(model.colors.accent.fg)) success_bar = true;
+                    if (cell.style.fg.eql(model.colors.danger.fg)) failure_bar = true;
+                }
+            }
+        }
+        try std.testing.expect(success_point and failure_point and overlap_point);
+        try std.testing.expect(success_bar and failure_bar);
+    }
 }

@@ -789,10 +789,13 @@ def main():
             terminal, True, "dynamic light scheme: pale panels and readable text"
         )
         terminal.send("\t\r")
-        terminal.contains("ADD ENDPOINT")
+        terminal.contains("ADD CANARY")
         terminal.send("\x1b")
-        terminal.contains("+ Endpoint")
-        terminal.click(5, 3)
+        terminal.wait(
+            lambda screen: "ADD CANARY" not in screen,
+            "Escape closes the first toolbar form",
+        )
+        terminal.click_label("+ Endpoint")
         terminal.contains("ADD ENDPOINT")
         check_overlay(terminal, "ADD ENDPOINT")
         terminal.send("primary\t")
