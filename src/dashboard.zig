@@ -859,14 +859,14 @@ pub const Dashboard = struct {
             return;
         }
         if (width >= 75) {
-            const chart_width = @max(@as(usize, 47), (width - 3) / 2);
+            const chart_width = @max(@as(usize, 41), (width - 3) / 2);
             const chart_height = @min(@as(usize, 9), height - 9);
-            try histogram(surface, ctx, self.colors, &canary.stats, now, x, y + 6, chart_width, chart_height);
-            try timeline(surface, ctx, self.colors, &canary.stats, now, x + chart_width + 3, y + 6, width - chart_width - 3, chart_height);
+            try histogram(surface, ctx, self.colors, &canary.stats, now, x, y + 5, chart_width, chart_height);
+            try timeline(surface, ctx, self.colors, &canary.stats, now, x + chart_width + 3, y + 5, width - chart_width - 3, chart_height);
         } else {
             const chart_height = @max(@as(usize, 2), (height - 12) / 2);
-            try histogram(surface, ctx, self.colors, &canary.stats, now, x, y + 6, width, chart_height);
-            try timeline(surface, ctx, self.colors, &canary.stats, now, x, y + 6 + chart_height + 3, width, chart_height);
+            try histogram(surface, ctx, self.colors, &canary.stats, now, x, y + 5, width, chart_height);
+            try timeline(surface, ctx, self.colors, &canary.stats, now, x, y + 5 + chart_height + 3, width, chart_height);
         }
     }
 
@@ -1248,12 +1248,12 @@ fn histogram(surface: vxfw.Surface, ctx: vxfw.DrawContext, colors: Palette, stat
     var peak: u128 = 1;
     for (successes, failures) |ok, fail| peak = @max(peak, @as(u128, ok) + fail);
     text(surface, ctx, x, y, width, try std.fmt.allocPrint(ctx.arena, "HISTOGRAM 60s  peak {d}", .{peak}), colors.muted);
-    const stride = @max(@as(usize, 1), (width -| 11) / 12);
-    const no_latency_x = x + width -| 10;
+    const stride = @max(@as(usize, 1), (width -| 5) / 12);
+    const untimed_x = x + width -| 4;
     for (successes, failures, 0..) |ok, fail, i| {
         const total = @as(u128, ok) + fail;
         if (total == 0) continue;
-        const bar_x = if (i == 12) no_latency_x else x + i * stride;
+        const bar_x = if (i == 12) untimed_x else x + i * stride;
         const n: usize = @intCast((total * height + peak - 1) / peak);
         const bar_width = @max(@as(usize, 1), stride -| 1);
         if (n == 1 and ok > 0 and fail > 0) {
@@ -1268,7 +1268,7 @@ fn histogram(surface: vxfw.Surface, ctx: vxfw.DrawContext, colors: Palette, stat
     }
     const labels = [_][]const u8{ "1", "2", "5", "10", "20", "50", ".1s", ".2s", ".5s", "1s", "5s", ">5s" };
     for (labels, 0..) |label, i| text(surface, ctx, x + i * stride, y + height + 1, stride, label, colors.muted);
-    text(surface, ctx, no_latency_x, y + height + 1, @min(width, 10), "No latency", colors.danger);
+    text(surface, ctx, untimed_x, y + height + 1, @min(width, 4), "fail", colors.danger);
     text(surface, ctx, x, y + height + 2, @min(width, 6), "■ OK", colors.accent);
     if (width > 6) text(surface, ctx, x + 6, y + height + 2, @min(width - 6, 8), "■ FAIL", colors.danger);
     if (width > 14) text(surface, ctx, x + 14, y + height + 2, width - 14, "≤ ms / s", colors.muted);
@@ -1278,6 +1278,10 @@ fn timeline(surface: vxfw.Surface, ctx: vxfw.DrawContext, colors: Palette, stats
     if (width == 0 or height == 0) return;
     const successes = stats.series(now, .success);
     const failures = stats.series(now, .failure);
+    const untimed = stats.untimedFailures(now);
+    const gutter = @min(@as(usize, 5), width - 1);
+    const plot_x = x + gutter;
+    const plot_width = width - gutter;
     var peak: f64 = 1;
     for ([_][60]?f64{ successes, failures }) |series| for (series) |value| {
         if (value) |n| peak = @max(peak, n);
@@ -1286,15 +1290,22 @@ fn timeline(surface: vxfw.Surface, ctx: vxfw.DrawContext, colors: Palette, stats
     for ([_][60]?f64{ successes, failures }, 0..) |series, channel| for (series, 0..) |value, i| {
         const n = value orelse continue;
         const row: usize = @intFromFloat(@round(n / peak * @as(f64, @floatFromInt(height - 1))));
-        const col = x + i * (width - 1) / 59;
+        const col = plot_x + i * (plot_width - 1) / 59;
         const point_y = y + height - row;
         const previous = surface.readCell(col, point_y).char.grapheme;
         const overlap = channel == 1 and (std.mem.eql(u8, previous, "•") or std.mem.eql(u8, previous, "⊗"));
         text(surface, ctx, col, point_y, 1, if (overlap) "⊗" else if (channel == 0) "•" else "×", if (overlap) colors.base else if (channel == 0) colors.accent else colors.danger);
     };
-    text(surface, ctx, x, y + height + 1, width, "-59s", colors.muted);
-    text(surface, ctx, x + width -| 3, y + height + 1, 3, "now", colors.muted);
-    text(surface, ctx, x, y + height + 2, @min(width, 6), "• OK", colors.accent);
-    if (width > 6) text(surface, ctx, x + 6, y + height + 2, @min(width - 6, 8), "× FAIL", colors.danger);
-    if (width > 14) text(surface, ctx, x + 14, y + height + 2, width - 14, "⊗ both", colors.base);
+    // This lane is outside the latency scale. A marker means at least one
+    // untimed failure in that second, not a zero-duration response.
+    text(surface, ctx, x, y + height + 1, gutter, "fail", colors.danger);
+    for (0..plot_width) |col| text(surface, ctx, plot_x + col, y + height + 1, 1, "─", colors.border);
+    for (untimed, 0..) |count, i| {
+        if (count != 0) text(surface, ctx, plot_x + i * (plot_width - 1) / 59, y + height + 1, 1, "×", colors.danger);
+    }
+    text(surface, ctx, plot_x, y + height + 2, plot_width, "-59s", colors.muted);
+    text(surface, ctx, plot_x + plot_width -| 3, y + height + 2, 3, "now", colors.muted);
+    text(surface, ctx, x, y + height + 3, @min(width, 6), "• OK", colors.accent);
+    if (width > 6) text(surface, ctx, x + 6, y + height + 3, @min(width - 6, 8), "× FAIL", colors.danger);
+    if (width > 14) text(surface, ctx, x + 14, y + height + 3, width - 14, "⊗ both", colors.base);
 }

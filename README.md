@@ -183,8 +183,10 @@ Wins reflect the first complete success observed by the client.
 
 The histogram and means use the current second and preceding 59 seconds.
 Histogram bars stack teal successes and red failures in the same latency bins.
-Failures with no measured duration appear in a separate red **No latency** bucket,
-not the zero-latency bin. They do not contribute to either mean-latency series.
+Failures with no measured duration appear in a separate red **fail** bucket,
+not the zero-latency bin. They also appear as red crosses in the **fail** lane
+beneath the mean plot, sharing its time axis but not its latency scale. They do
+not contribute to either mean-latency series.
 The time plot shows two independently averaged per-second series on one scale:
 teal dots for successful latency and red crosses for time to failure. A circled
 cross marks pixels containing both series. Each series has gaps when it has no

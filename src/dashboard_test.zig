@@ -245,16 +245,17 @@ test "discovery retains runner identity through controller overlap and failure" 
     try std.testing.expectEqual(@as(u64, 1), canary.stats.successes);
 }
 
-fn labelPosition(rendered: []const u8, label: []const u8, ctx: vxfw.DrawContext) !struct { x: usize, y: usize } {
+fn labelPosition(rendered: []const u8, label: []const u8, ctx: vxfw.DrawContext, first_row: usize) !struct { x: usize, y: usize } {
     var lines = std.mem.splitScalar(u8, rendered, '\n');
     var y: usize = 0;
     while (lines.next()) |line| : (y += 1) {
+        if (y < first_row) continue;
         if (std.mem.indexOf(u8, line, label)) |offset| return .{ .x = ctx.stringWidth(line[0..offset]), .y = y };
     }
     return error.MissingChartLabel;
 }
 
-test "charts distinguish failures, successes and overlap and durationless failures have no mean points" {
+test "charts separate measured means and untimed failure lanes" {
     const a = std.testing.allocator;
     var runner = api.Runner.init(a, std.testing.io);
     defer runner.deinit();
@@ -267,21 +268,22 @@ test "charts distinguish failures, successes and overlap and durationless failur
     stats.record(now - 4_000, .{ .failure = 200 });
     stats.record(now - 2_000, .{ .success = 10 });
     stats.record(now - 2_000, .{ .failure = 10 });
+    stats.record(now - 59_000, .{ .failure = null });
     stats.record(now - 1_000, .{ .failure = null });
-    for ([_]vxfw.Size{ .{ .width = 80, .height = 24 }, .{ .width = 120, .height = 32 } }) |size| {
+    for ([_]vxfw.Size{ .{ .width = 74, .height = 40 }, .{ .width = 80, .height = 24 }, .{ .width = 111, .height = 32 }, .{ .width = 120, .height = 32 } }) |size| {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const ctx = context(arena.allocator(), size);
         const frame = try model.widget().draw(ctx);
         const rendered = try frameText(a, frame);
         defer a.free(rendered);
-        try std.testing.expect(std.mem.indexOf(u8, rendered, "OK 2  FAIL 3  Mean OK (60s) 15.00ms") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "OK 2  FAIL 4  Mean OK (60s) 15.00ms") != null);
         try std.testing.expect(std.mem.indexOf(u8, rendered, "MEAN / SECOND  top 200.0ms") != null);
         try std.testing.expect(std.mem.indexOf(u8, rendered, "SKIP") == null);
-        const no_latency = try labelPosition(rendered, "No latency", ctx);
-        const hist = try labelPosition(rendered, "HISTOGRAM", ctx);
-        const mean = try labelPosition(rendered, "MEAN / SECOND", ctx);
-        const axis = try labelPosition(rendered, "-59s", ctx);
+        const hist = try labelPosition(rendered, "HISTOGRAM", ctx, 0);
+        const no_latency = try labelPosition(rendered, "fail", ctx, hist.y + 1);
+        const mean = try labelPosition(rendered, "MEAN / SECOND", ctx, 0);
+        const axis = try labelPosition(rendered, "-59s", ctx, 0);
         const cells = try arena.allocator().alloc(@import("vaxis").Cell, @as(usize, size.width) * size.height);
         @memset(cells, .{});
         paint(frame, cells, size, 0, 0);
@@ -295,7 +297,7 @@ test "charts distinguish failures, successes and overlap and durationless failur
         for (cells, 0..) |cell, i| {
             const x = i % size.width;
             const y = i / size.width;
-            if (x >= mean.x and y > mean.y and y < axis.y) {
+            if (x >= mean.x and y > mean.y and y < axis.y - 1) {
                 if (std.mem.eql(u8, cell.char.grapheme, "•") and cell.style.fg.eql(model.colors.accent.fg)) success_point = true;
                 if (std.mem.eql(u8, cell.char.grapheme, "×") and cell.style.fg.eql(model.colors.danger.fg)) failure_point = true;
                 if (std.mem.eql(u8, cell.char.grapheme, "⊗")) overlap_point = true;
@@ -312,5 +314,18 @@ test "charts distinguish failures, successes and overlap and durationless failur
         const untimed_bar = cells[(no_latency.y - 1) * size.width + no_latency.x];
         try std.testing.expectEqualStrings("█", untimed_bar.char.grapheme);
         try std.testing.expect(untimed_bar.style.fg.eql(model.colors.danger.fg));
+        const lane_y = axis.y - 1;
+        var lane_markers: usize = 0;
+        for (cells[lane_y * size.width + axis.x .. (lane_y + 1) * size.width]) |cell| {
+            if (std.mem.eql(u8, cell.char.grapheme, "×") and cell.style.fg.eql(model.colors.danger.fg)) lane_markers += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), lane_markers);
+        const oldest = cells[lane_y * size.width + axis.x];
+        try std.testing.expectEqualStrings("×", oldest.char.grapheme);
+        const present = try labelPosition(rendered, "now", ctx, axis.y);
+        const recent_x = axis.x + 58 * (present.x + 2 - axis.x) / 59;
+        const recent = cells[lane_y * size.width + recent_x];
+        try std.testing.expectEqualStrings("×", recent.char.grapheme);
+        try std.testing.expect(axis.x > mean.x);
     }
 }

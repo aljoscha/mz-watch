@@ -89,6 +89,18 @@ pub const Stats = struct {
         return result;
     }
 
+    /// Counts of failures without a duration, oldest second first.
+    pub fn untimedFailures(self: *const Stats, now_ms: i64) [60]u64 {
+        var result: [60]u64 = @splat(0);
+        const now_second = @divFloor(now_ms, 1000);
+        for (&result, 0..) |*value, offset| {
+            const second = now_second - 59 + @as(i64, @intCast(offset));
+            const bucket = self.buckets[index(second)];
+            if (bucket.second == second) value.* = bucket.histograms[@backingInt(Series.failure)][12];
+        }
+        return result;
+    }
+
     pub fn reset(self: *Stats) void {
         self.* = .{};
     }
@@ -207,4 +219,26 @@ test "timed outcomes have independent histograms, weighted means, gaps and expir
     stats.reset();
     try std.testing.expectEqual(@as(u64, 0), stats.failures);
     try std.testing.expectEqual(@as(?f64, null), stats.mean(2000, .failure));
+}
+
+test "untimed failure lane has independent counts, gaps and expiry" {
+    var stats: Stats = .{};
+    stats.record(-1, .{ .failure = null });
+    stats.record(0, .{ .success = 10 });
+    stats.record(0, .{ .failure = 20 });
+    stats.record(1000, .{ .failure = null });
+    stats.record(1999, .{ .failure = null });
+    const counts = stats.untimedFailures(2000);
+    try std.testing.expectEqual(@as(u64, 1), counts[56]);
+    try std.testing.expectEqual(@as(u64, 0), counts[57]);
+    try std.testing.expectEqual(@as(u64, 2), counts[58]);
+    try std.testing.expectEqual(@as(u64, 0), counts[59]);
+    try std.testing.expectEqual(@as(u64, 2), stats.untimedFailures(60000)[0]);
+    try std.testing.expectEqual(@as([60]u64, @splat(0)), stats.untimedFailures(61000));
+    stats.record(61000, .{ .failure = null });
+    stats.record(1000, .{ .failure = null });
+    try std.testing.expectEqual(@as(u64, 1), stats.untimedFailures(61000)[59]);
+    try std.testing.expectEqual(@as(u64, 0), stats.untimedFailures(1000)[59]);
+    stats.reset();
+    try std.testing.expectEqual(@as([60]u64, @splat(0)), stats.untimedFailures(61000));
 }
