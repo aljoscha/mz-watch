@@ -226,9 +226,9 @@ def endpoint_outcome(terminal, endpoint, status):
         if card is None or len(card) != 6:
             return False
         counts = (
-            r"ok [1-9][0-9]*  errors \d+  skipped \d+  wins \d+"
+            r"ok [1-9][0-9]*  errors \d+  wins \d+"
             if status == "success"
-            else r"ok \d+  errors [1-9][0-9]*  skipped \d+  wins \d+"
+            else r"ok \d+  errors [1-9][0-9]*  wins \d+"
         )
         return (
             card[2].strip(" │┃") == f"Current: {status}"
@@ -866,9 +866,9 @@ def main():
         terminal.send("2")
         terminal.wait(
             lambda screen: (
-                "skipped" in endpoint_cards(screen).get("primary", [""] * 6)[4]
+                "errors" in endpoint_cards(screen).get("primary", [""] * 6)[4]
             ),
-            "paused primary card retains its skipped counter",
+            "paused primary card retains its error counter",
         )
         terminal.send("x")
         terminal.contains("Remove selected item?")

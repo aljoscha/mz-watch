@@ -281,10 +281,7 @@ def check_cards(terminal, count, sources, absent=()):
             and all(source not in source_lines for source in absent)
             and all("[discovered " in card[1] for card in found)
             and all(re.search(r"\w+/g\d+/a\d+ \(front\d+\)", card[0]) for card in found)
-            and all(
-                re.search(r"ok 0  errors \d+  skipped \d+  wins 0", card[4])
-                for card in found
-            )
+            and all(re.search(r"ok 0  errors \d+  wins 0", card[4]) for card in found)
             and "internal.invalid" not in frame
             and "custom.invalid" not in frame
         )

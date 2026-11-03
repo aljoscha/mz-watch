@@ -1,11 +1,12 @@
 const std = @import("std");
 
 /// Inclusive upper bounds in milliseconds. Bin 11 contains larger latencies.
+/// Bin 12 contains failures without a measured latency.
 pub const histogram_bounds_ms: [11]f64 = .{ 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000 };
 
 pub const Series = enum { success, failure };
-/// A run either finishes with a measured outcome or has no available endpoint.
-pub const Outcome = union(enum) { success: f64, failure: f64, skipped };
+/// Failures without a latency count against availability, not latency means.
+pub const Outcome = union(enum) { success: f64, failure: ?f64 };
 
 /// Allocation-free statistics for the current second and preceding 59 seconds.
 /// Measured durations must be finite and nonnegative. Lifetime counters include
@@ -13,22 +14,17 @@ pub const Outcome = union(enum) { success: f64, failure: f64, skipped };
 pub const Stats = struct {
     successes: u64 = 0,
     failures: u64 = 0,
-    skipped: u64 = 0,
     buckets: [60]Bucket = @splat(.{}),
 
     const Bucket = struct {
         second: ?i64 = null,
         counts: [2]u64 = @splat(0),
         sums: [2]f64 = @splat(0),
-        histograms: [2][12]u64 = @splat(@splat(0)),
+        histograms: [2][13]u64 = @splat(@splat(0)),
     };
 
     pub fn record(self: *Stats, at_ms: i64, outcome: Outcome) void {
         const latency = switch (outcome) {
-            .skipped => {
-                self.skipped += 1;
-                return;
-            },
             .success => |duration| blk: {
                 self.successes += 1;
                 break :blk duration;
@@ -47,15 +43,19 @@ pub const Stats = struct {
             if (stored_second > second) return;
         }
         if (bucket.second != second) bucket.* = .{ .second = second };
+        const duration = latency orelse {
+            bucket.histograms[channel][12] += 1;
+            return;
+        };
         bucket.counts[channel] += 1;
-        bucket.sums[channel] += latency;
+        bucket.sums[channel] += duration;
         var bin: usize = 0;
-        while (bin < histogram_bounds_ms.len and latency > histogram_bounds_ms[bin]) : (bin += 1) {}
+        while (bin < histogram_bounds_ms.len and duration > histogram_bounds_ms[bin]) : (bin += 1) {}
         bucket.histograms[channel][bin] += 1;
     }
 
-    pub fn histogram(self: *const Stats, now_ms: i64, kind: Series) [12]u64 {
-        var result: [12]u64 = @splat(0);
+    pub fn histogram(self: *const Stats, now_ms: i64, kind: Series) [13]u64 {
+        var result: [13]u64 = @splat(0);
         const now_second = @divFloor(now_ms, 1000);
         for (self.buckets) |bucket| {
             if (!inWindow(bucket.second, now_second)) continue;
@@ -116,7 +116,7 @@ test "window expiry and chronological gaps without new observations" {
     try std.testing.expectEqual(@as(?f64, 30), stats.mean(60000, .success));
     try std.testing.expectEqual(@as(?f64, null), stats.series(60000, .success)[0]);
     try std.testing.expectEqual(@as(?f64, null), stats.mean(62000, .success));
-    try std.testing.expectEqual(@as([12]u64, @splat(0)), stats.histogram(62000, .success));
+    try std.testing.expectEqual(@as([13]u64, @splat(0)), stats.histogram(62000, .success));
     for (stats.series(62000, .success)) |value| try std.testing.expectEqual(@as(?f64, null), value);
 }
 
@@ -138,7 +138,7 @@ test "both histogram series retain inclusive boundaries and overflow" {
             stats.record(0, if (kind == .success) .{ .success = bound } else .{ .failure = bound });
             stats.record(0, if (kind == .success) .{ .success = bound + 0.5 } else .{ .failure = bound + 0.5 });
         }
-        const expected: [12]u64 = .{ 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1 };
+        const expected: [13]u64 = .{ 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0 };
         try std.testing.expectEqual(expected, stats.histogram(0, kind));
     }
 }
@@ -147,7 +147,7 @@ test "success summaries exclude failure durations while lifetime counts survive 
     var stats: Stats = .{};
     stats.record(0, .{ .failure = 50 });
     try std.testing.expectEqual(@as(?f64, null), stats.mean(0, .success));
-    try std.testing.expectEqual(@as([12]u64, @splat(0)), stats.histogram(0, .success));
+    try std.testing.expectEqual(@as([13]u64, @splat(0)), stats.histogram(0, .success));
     stats.record(0, .{ .success = 0 });
     stats.record(0, .{ .success = 10 });
     stats.record(0, .{ .failure = 50 });
@@ -182,7 +182,7 @@ test "timed outcomes have independent histograms, weighted means, gaps and expir
     stats.record(0, .{ .failure = 500 });
     stats.record(500, .{ .failure = 100 });
     stats.record(1000, .{ .failure = 20 });
-    stats.record(2000, .skipped);
+    stats.record(2000, .{ .failure = null });
     try std.testing.expectEqual(@as(?f64, 10), stats.mean(2000, .success));
     try std.testing.expectEqual(@as(?f64, 620.0 / 3.0), stats.mean(2000, .failure));
     const successes = stats.histogram(2000, .success);
@@ -195,15 +195,16 @@ test "timed outcomes have independent histograms, weighted means, gaps and expir
     try std.testing.expectEqual(@as(?f64, 20), stats.series(2000, .failure)[58]);
     try std.testing.expectEqual(@as(?f64, null), stats.series(2000, .success)[58]);
     try std.testing.expectEqual(@as(?f64, null), stats.series(2000, .failure)[59]);
-    try std.testing.expectEqual(@as(u64, 1), stats.skipped);
+    try std.testing.expectEqual(@as(u64, 1), failures[12]);
+    try std.testing.expectEqual(@as(u64, 1), stats.histogram(61000, .failure)[12]);
     for (std.enums.values(Series)) |kind| {
-        try std.testing.expectEqual(@as(?f64, null), stats.mean(61000, kind));
-        try std.testing.expectEqual(@as([12]u64, @splat(0)), stats.histogram(61000, kind));
-        for (stats.series(61000, kind)) |value| try std.testing.expectEqual(@as(?f64, null), value);
+        try std.testing.expectEqual(@as(?f64, null), stats.mean(62000, kind));
+        try std.testing.expectEqual(@as([13]u64, @splat(0)), stats.histogram(62000, kind));
+        for (stats.series(62000, kind)) |value| try std.testing.expectEqual(@as(?f64, null), value);
     }
     try std.testing.expectEqual(@as(u64, 1), stats.successes);
-    try std.testing.expectEqual(@as(u64, 3), stats.failures);
+    try std.testing.expectEqual(@as(u64, 4), stats.failures);
     stats.reset();
-    try std.testing.expectEqual(@as(u64, 0), stats.skipped);
+    try std.testing.expectEqual(@as(u64, 0), stats.failures);
     try std.testing.expectEqual(@as(?f64, null), stats.mean(2000, .failure));
 }

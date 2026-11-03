@@ -280,7 +280,7 @@ const State = struct {
     }
 
     fn schedule(self: *State, canary: *Canary, now: i64) !void {
-        if (canary.paused or canary.slots.items.len == 0 or now < canary.next_ns) return;
+        if (canary.paused or now < canary.next_ns) return;
         // Missed schedule ticks are not replayed as a catch-up burst.
         canary.next_ns = now + @as(i64, canary.config.interval_ms) * std.time.ns_per_ms;
         var available: usize = 0;
@@ -292,7 +292,7 @@ const State = struct {
             }
         }
         if (available == 0) {
-            try self.runner.emit(.{ .sample = .{ .canary = canary.config.id, .at_ms = @divFloor(now, std.time.ns_per_ms), .outcome = .skipped, .winner = null } });
+            try self.runner.emit(.{ .sample = .{ .canary = canary.config.id, .at_ms = @divFloor(now, std.time.ns_per_ms), .outcome = .{ .failure = null }, .winner = null } });
             return;
         }
         const race = try self.runner.allocator.create(Race);

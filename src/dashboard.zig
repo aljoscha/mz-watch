@@ -15,7 +15,6 @@ const Observation = struct {
     latency: ?f64 = null,
     successes: u64 = 0,
     errors: u64 = 0,
-    skipped: u64 = 0,
     wins: u64 = 0,
     sqlstate: [5]u8 = @splat(' '),
 };
@@ -149,7 +148,7 @@ const Row = struct {
                 const sqlstate = std.mem.trim(u8, &value.sqlstate, " ");
                 text(surface, ctx, 2, 3, width -| 2, try std.fmt.allocPrint(ctx.arena, "Last result: {s}{s}{s}", .{ last, if (sqlstate.len > 0) "  SQLSTATE " else "", sqlstate }), last_style);
                 const latency = if (value.latency) |n| try std.fmt.allocPrint(ctx.arena, "{d:.2}ms", .{n}) else "-";
-                text(surface, ctx, 2, 4, width -| 2, try std.fmt.allocPrint(ctx.arena, "Last result latency: {s}  ok {d}  errors {d}  skipped {d}  wins {d}", .{ latency, value.successes, value.errors, value.skipped, value.wins }), muted);
+                text(surface, ctx, 2, 4, width -| 2, try std.fmt.allocPrint(ctx.arena, "Last result latency: {s}  ok {d}  errors {d}  wins {d}", .{ latency, value.successes, value.errors, value.wins }), muted);
             } else text(surface, ctx, 2, 2, width -| 2, "No canaries", muted);
             var separator = self.owner.colors.border;
             separator.bg = style.bg;
@@ -385,8 +384,7 @@ pub const Dashboard = struct {
                 }
                 switch (outcome.status) {
                     .success => value.successes += 1,
-                    .query_error, .timeout, .connection_error => value.errors += 1,
-                    .busy, .unavailable => value.skipped += 1,
+                    .query_error, .timeout, .connection_error, .busy, .unavailable => value.errors += 1,
                     else => {},
                 }
             },
@@ -853,7 +851,7 @@ pub const Dashboard = struct {
         text(surface, ctx, x, y + 1, width, canary.sql, self.colors.muted);
         text(surface, ctx, x, y + 2, width, try std.fmt.allocPrint(ctx.arena, "Every {d}ms  /  deadline {d}ms  /  {d} endpoints", .{ canary.interval_ms, canary.timeout_ms, self.endpoints.items.len }), self.colors.muted);
         const mean = if (canary.stats.mean(now, .success)) |value| try std.fmt.allocPrint(ctx.arena, "{d:.2}ms", .{value}) else "no samples";
-        text(surface, ctx, x, y + 3, width, try std.fmt.allocPrint(ctx.arena, "OK {d}  FAIL {d}  SKIP {d}  Mean OK (60s) {s}", .{ canary.stats.successes, canary.stats.failures, canary.stats.skipped, mean }), self.colors.base);
+        text(surface, ctx, x, y + 3, width, try std.fmt.allocPrint(ctx.arena, "OK {d}  FAIL {d}  Mean OK (60s) {s}", .{ canary.stats.successes, canary.stats.failures, mean }), self.colors.base);
         const winner = if (canary.winner) |id| if (self.endpointIndex(id)) |i| self.endpoints.items[i].name else "removed" else "none";
         text(surface, ctx, x, y + 4, width, try std.fmt.allocPrint(ctx.arena, "Last winner: {s}", .{winner}), self.colors.accent);
         if (height < 11 or width < 36 or (width < 75 and height < 16)) {
@@ -861,7 +859,7 @@ pub const Dashboard = struct {
             return;
         }
         if (width >= 75) {
-            const chart_width = (width - 3) / 2;
+            const chart_width = @max(@as(usize, 47), (width - 3) / 2);
             const chart_height = @min(@as(usize, 9), height - 9);
             try histogram(surface, ctx, self.colors, &canary.stats, now, x, y + 6, chart_width, chart_height);
             try timeline(surface, ctx, self.colors, &canary.stats, now, x + chart_width + 3, y + 6, width - chart_width - 3, chart_height);
@@ -1250,24 +1248,27 @@ fn histogram(surface: vxfw.Surface, ctx: vxfw.DrawContext, colors: Palette, stat
     var peak: u128 = 1;
     for (successes, failures) |ok, fail| peak = @max(peak, @as(u128, ok) + fail);
     text(surface, ctx, x, y, width, try std.fmt.allocPrint(ctx.arena, "HISTOGRAM 60s  peak {d}", .{peak}), colors.muted);
-    const stride = @max(@as(usize, 1), width / 12);
+    const stride = @max(@as(usize, 1), (width -| 11) / 12);
+    const no_latency_x = x + width -| 10;
     for (successes, failures, 0..) |ok, fail, i| {
         const total = @as(u128, ok) + fail;
         if (total == 0) continue;
+        const bar_x = if (i == 12) no_latency_x else x + i * stride;
         const n: usize = @intCast((total * height + peak - 1) / peak);
         const bar_width = @max(@as(usize, 1), stride -| 1);
         if (n == 1 and ok > 0 and fail > 0) {
             // Two colors in one terminal cell keep a small mixed bin visible.
             var mixed = colors.danger;
             mixed.bg = colors.accent.fg;
-            text(surface, ctx, x + i * stride, y + height, bar_width, "▀▀", mixed);
+            text(surface, ctx, bar_x, y + height, bar_width, "▀▀", mixed);
             continue;
         }
         const ok_height: usize = if (ok == 0) 0 else if (fail == 0) n else @intCast(@max(1, @min(n - 1, (@as(u128, ok) * n + total / 2) / total)));
-        for (0..n) |row_y| text(surface, ctx, x + i * stride, y + height - row_y, bar_width, "██", if (row_y < ok_height) colors.accent else colors.danger);
+        for (0..n) |row_y| text(surface, ctx, bar_x, y + height - row_y, bar_width, "██", if (row_y < ok_height) colors.accent else colors.danger);
     }
     const labels = [_][]const u8{ "1", "2", "5", "10", "20", "50", ".1s", ".2s", ".5s", "1s", "5s", ">5s" };
     for (labels, 0..) |label, i| text(surface, ctx, x + i * stride, y + height + 1, stride, label, colors.muted);
+    text(surface, ctx, no_latency_x, y + height + 1, @min(width, 10), "No latency", colors.danger);
     text(surface, ctx, x, y + height + 2, @min(width, 6), "■ OK", colors.accent);
     if (width > 6) text(surface, ctx, x + 6, y + height + 2, @min(width - 6, 8), "■ FAIL", colors.danger);
     if (width > 14) text(surface, ctx, x + 14, y + height + 2, width - 14, "≤ ms / s", colors.muted);
@@ -1281,7 +1282,7 @@ fn timeline(surface: vxfw.Surface, ctx: vxfw.DrawContext, colors: Palette, stats
     for ([_][60]?f64{ successes, failures }) |series| for (series) |value| {
         if (value) |n| peak = @max(peak, n);
     };
-    text(surface, ctx, x, y, width, try std.fmt.allocPrint(ctx.arena, "MEAN / SECOND  top {d:.1}ms", .{peak}), colors.muted);
+    text(surface, ctx, x, y, width, try std.fmt.allocPrint(ctx.arena, "MEAN / SECOND {s}{d:.1}ms", .{ if (width < 27) "" else " top ", peak }), colors.muted);
     for ([_][60]?f64{ successes, failures }, 0..) |series, channel| for (series, 0..) |value, i| {
         const n = value orelse continue;
         const row: usize = @intFromFloat(@round(n / peak * @as(f64, @floatFromInt(height - 1))));

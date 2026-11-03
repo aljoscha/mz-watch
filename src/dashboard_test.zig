@@ -254,7 +254,7 @@ fn labelPosition(rendered: []const u8, label: []const u8, ctx: vxfw.DrawContext)
     return error.MissingChartLabel;
 }
 
-test "charts distinguish failures, successes and overlap while skipped runs have no points" {
+test "charts distinguish failures, successes and overlap and durationless failures have no mean points" {
     const a = std.testing.allocator;
     var runner = api.Runner.init(a, std.testing.io);
     defer runner.deinit();
@@ -267,7 +267,7 @@ test "charts distinguish failures, successes and overlap while skipped runs have
     stats.record(now - 4_000, .{ .failure = 200 });
     stats.record(now - 2_000, .{ .success = 10 });
     stats.record(now - 2_000, .{ .failure = 10 });
-    stats.record(now - 1_000, .skipped);
+    stats.record(now - 1_000, .{ .failure = null });
     for ([_]vxfw.Size{ .{ .width = 80, .height = 24 }, .{ .width = 120, .height = 32 } }) |size| {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -275,8 +275,10 @@ test "charts distinguish failures, successes and overlap while skipped runs have
         const frame = try model.widget().draw(ctx);
         const rendered = try frameText(a, frame);
         defer a.free(rendered);
-        try std.testing.expect(std.mem.indexOf(u8, rendered, "OK 2  FAIL 2  SKIP 1  Mean OK (60s) 15.00ms") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "OK 2  FAIL 3  Mean OK (60s) 15.00ms") != null);
         try std.testing.expect(std.mem.indexOf(u8, rendered, "MEAN / SECOND  top 200.0ms") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "SKIP") == null);
+        const no_latency = try labelPosition(rendered, "No latency", ctx);
         const hist = try labelPosition(rendered, "HISTOGRAM", ctx);
         const mean = try labelPosition(rendered, "MEAN / SECOND", ctx);
         const axis = try labelPosition(rendered, "-59s", ctx);
@@ -307,5 +309,8 @@ test "charts distinguish failures, successes and overlap while skipped runs have
         }
         try std.testing.expect(success_point and failure_point and overlap_point);
         try std.testing.expect(success_bar and failure_bar);
+        const untimed_bar = cells[(no_latency.y - 1) * size.width + no_latency.x];
+        try std.testing.expectEqualStrings("█", untimed_bar.char.grapheme);
+        try std.testing.expect(untimed_bar.style.fg.eql(model.colors.danger.fg));
     }
 }

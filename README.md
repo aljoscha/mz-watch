@@ -162,7 +162,8 @@ saved file stays intact. A subsequent configuration change retries saving.
 
 Each scheduled run races one SQL statement across all available endpoints.
 Every canary/endpoint pair has its own persistent connection and at most one
-outstanding request. Busy or disconnected endpoints are reported as skipped.
+outstanding request. Busy or disconnected endpoints retain those diagnostic
+statuses and count as unsuccessful attempts.
 Missed ticks are not queued or replayed as catch-up bursts.
 
 The first **complete successful result** wins. Latency uses a monotonic clock,
@@ -170,10 +171,10 @@ from the run's start through receipt of all query results. It includes a
 `BEGIN READ ONLY` round trip, query planning, execution and result transfer, but
 not the cleanup `ROLLBACK`. Errors never win. A participating race without any
 success is counted as failed once its last endpoint finishes or times out. Its
-duration runs from race start to that final outcome. Individual losing errors do not create
-failed samples when a peer succeeds. Schedules with only busy or unavailable
-endpoints increment a separate skipped count, without inventing a latency. With
-no endpoints configured, no runs are sampled.
+duration runs from race start to that final outcome. Individual losing errors do
+not create failed samples when a peer succeeds. Every scheduled run that cannot
+start, including with no configured endpoints, counts as a failure without
+inventing a latency. Paused canaries produce no runs.
 
 Dispatch and socket servicing rotate endpoint priority. Wins need not be evenly
 distributed, even for two connections to the same server. When multiple sockets
@@ -182,12 +183,14 @@ Wins reflect the first complete success observed by the client.
 
 The histogram and means use the current second and preceding 59 seconds.
 Histogram bars stack teal successes and red failures in the same latency bins.
+Failures with no measured duration appear in a separate red **No latency** bucket,
+not the zero-latency bin. They do not contribute to either mean-latency series.
 The time plot shows two independently averaged per-second series on one scale:
 teal dots for successful latency and red crosses for time to failure. A circled
 cross marks pixels containing both series. Each series has gaps when it has no
 samples, never zero-filled values. The headline **Mean OK** is success-only.
-Success, failure and skipped counters are lifetime totals for that canary.
-Endpoint detail shows outcomes, skipped attempts, wins and SQLSTATEs
+Success and failure counters are lifetime totals for that canary.
+Endpoint detail shows current activity, unsuccessful attempts, wins and SQLSTATEs
 without exposing credential-bearing server error text.
 
 Use read-only queries and preferably a read-only database user. One-statement
@@ -212,7 +215,7 @@ scripts/integration.sh
 
 The integration script starts an isolated PostgreSQL container on a randomly
 allocated localhost port and removes it afterward. It checks early winners,
-losing outcomes, failures, read-only enforcement, deadlines, skipped schedules,
+losing outcomes, failures, read-only enforcement, deadlines, missed availability,
 in-flight connection loss and recovery, configuration changes and shutdown.
 Requires Docker. `ZIG` can override the
 compiler executable.
