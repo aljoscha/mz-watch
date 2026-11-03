@@ -290,7 +290,6 @@ test "charts show untimed failures at zero without changing means" {
         paint(frame, cells, size, 0, 0);
         var success_point = false;
         var failure_point = false;
-        var overlap_point = false;
         var success_bar = false;
         var failure_bar = false;
         const hist_bottom = if (hist.y == mean.y) axis.y else mean.y - 1;
@@ -301,7 +300,6 @@ test "charts show untimed failures at zero without changing means" {
             if (x >= mean.x and y > mean.y and y < axis.y) {
                 if (std.mem.eql(u8, cell.char.grapheme, "•") and cell.style.fg.eql(model.colors.accent.fg)) success_point = true;
                 if (std.mem.eql(u8, cell.char.grapheme, "×") and cell.style.fg.eql(model.colors.danger.fg)) failure_point = true;
-                if (std.mem.eql(u8, cell.char.grapheme, "⊗")) overlap_point = true;
             }
             if (x >= hist.x and x < hist_end and y > hist.y and y < hist_bottom) {
                 if (std.mem.eql(u8, cell.char.grapheme, "█")) {
@@ -310,7 +308,8 @@ test "charts show untimed failures at zero without changing means" {
                 }
             }
         }
-        try std.testing.expect(success_point and failure_point and overlap_point);
+        try std.testing.expect(success_point and failure_point);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "⊗") == null);
         try std.testing.expect(success_bar and failure_bar);
         const untimed_bar = cells[(no_latency.y - 1) * size.width + no_latency.x];
         try std.testing.expectEqualStrings("█", untimed_bar.char.grapheme);
@@ -324,6 +323,10 @@ test "charts show untimed failures at zero without changing means" {
         const oldest = cells[baseline_y * size.width + axis.x];
         try std.testing.expectEqualStrings("×", oldest.char.grapheme);
         const present = try labelPosition(rendered, "now", ctx, axis.y);
+        const shared_x = axis.x + 57 * (present.x + 2 - axis.x) / 59;
+        const shared = cells[baseline_y * size.width + shared_x];
+        try std.testing.expectEqualStrings("•", shared.char.grapheme);
+        try std.testing.expect(shared.style.fg.eql(model.colors.accent.fg));
         const recent_x = axis.x + 58 * (present.x + 2 - axis.x) / 59;
         const recent = cells[baseline_y * size.width + recent_x];
         try std.testing.expectEqualStrings("×", recent.char.grapheme);

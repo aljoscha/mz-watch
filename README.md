@@ -188,10 +188,10 @@ after `>5s`, not in the zero-latency bin. The time plot shows these failures as
 red crosses at 0 ms. These are display-only markers, not measured durations,
 and do not contribute to either mean-latency series.
 The time plot shows two independently averaged per-second series on one scale:
-teal dots for successful latency and red crosses for time to failure. A circled
-cross marks pixels containing both outcome types. Measured series have gaps
-when there are no samples, never zero-filled values. The headline **Mean OK**
-is success-only.
+teal dots for successful latency and red crosses for time to failure. Success
+points take precedence when outcomes share a terminal cell. Measured series
+have gaps when there are no samples, never zero-filled values. The headline
+**Mean OK** is success-only.
 Success and failure counters are lifetime totals for that canary.
 Endpoint detail shows current activity, unsuccessful attempts, wins and SQLSTATEs
 without exposing credential-bearing server error text.

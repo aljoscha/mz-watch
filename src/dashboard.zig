@@ -1289,18 +1289,16 @@ fn timeline(surface: vxfw.Surface, ctx: vxfw.DrawContext, colors: Palette, stats
         if (value) |n| peak = @max(peak, n);
     };
     text(surface, ctx, x, y, width, try std.fmt.allocPrint(ctx.arena, "MEAN / SECOND {s}{d:.1}ms", .{ if (width < 27) "" else " top ", peak }), colors.muted);
-    for ([_][60]?f64{ successes, failures, untimed }, 0..) |series, channel| for (series, 0..) |value, i| {
+    // Draw successes last so they win terminal-cell collisions.
+    for ([_][60]?f64{ failures, untimed, successes }, 0..) |series, channel| for (series, 0..) |value, i| {
         const n = value orelse continue;
         const row: usize = @intFromFloat(@round(n / peak * @as(f64, @floatFromInt(height - 1))));
         const col = x + i * (width - 1) / 59;
         const point_y = y + height - row;
-        const previous = surface.readCell(col, point_y).char.grapheme;
-        const overlap = channel != 0 and (std.mem.eql(u8, previous, "•") or std.mem.eql(u8, previous, "⊗"));
-        text(surface, ctx, col, point_y, 1, if (overlap) "⊗" else if (channel == 0) "•" else "×", if (overlap) colors.base else if (channel == 0) colors.accent else colors.danger);
+        text(surface, ctx, col, point_y, 1, if (channel == 2) "•" else "×", if (channel == 2) colors.accent else colors.danger);
     };
     text(surface, ctx, x, y + height + 1, width, "-59s", colors.muted);
     text(surface, ctx, x + width -| 3, y + height + 1, 3, "now", colors.muted);
     text(surface, ctx, x, y + height + 2, @min(width, 6), "• OK", colors.accent);
     if (width > 6) text(surface, ctx, x + 6, y + height + 2, @min(width - 6, 8), "× FAIL", colors.danger);
-    if (width > 14) text(surface, ctx, x + 14, y + height + 2, width - 14, "⊗ both", colors.base);
 }
