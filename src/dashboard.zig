@@ -1248,12 +1248,12 @@ fn histogram(surface: vxfw.Surface, ctx: vxfw.DrawContext, colors: Palette, stat
     var peak: u128 = 1;
     for (successes, failures) |ok, fail| peak = @max(peak, @as(u128, ok) + fail);
     text(surface, ctx, x, y, width, try std.fmt.allocPrint(ctx.arena, "HISTOGRAM 60s  peak {d}", .{peak}), colors.muted);
-    const stride = @max(@as(usize, 1), (width -| 5) / 12);
-    const untimed_x = x + width -| 4;
+    const stride = @max(@as(usize, 1), (width -| 4) / 12);
+    const untimed_x = x + 12 * stride;
     for (successes, failures, 0..) |ok, fail, i| {
         const total = @as(u128, ok) + fail;
         if (total == 0) continue;
-        const bar_x = if (i == 12) untimed_x else x + i * stride;
+        const bar_x = x + i * stride;
         const n: usize = @intCast((total * height + peak - 1) / peak);
         const bar_width = @max(@as(usize, 1), stride -| 1);
         if (n == 1 and ok > 0 and fail > 0) {
@@ -1278,34 +1278,29 @@ fn timeline(surface: vxfw.Surface, ctx: vxfw.DrawContext, colors: Palette, stats
     if (width == 0 or height == 0) return;
     const successes = stats.series(now, .success);
     const failures = stats.series(now, .failure);
-    const untimed = stats.untimedFailures(now);
-    const gutter = @min(@as(usize, 5), width - 1);
-    const plot_x = x + gutter;
-    const plot_width = width - gutter;
+    // Untimed failures use zero-height markers for visibility, not zero-valued
+    // measurements. Keep them separate from the averaged latency series.
+    var untimed: [60]?f64 = @splat(null);
+    for (stats.untimedFailures(now), &untimed) |count, *marker| {
+        if (count != 0) marker.* = 0;
+    }
     var peak: f64 = 1;
     for ([_][60]?f64{ successes, failures }) |series| for (series) |value| {
         if (value) |n| peak = @max(peak, n);
     };
     text(surface, ctx, x, y, width, try std.fmt.allocPrint(ctx.arena, "MEAN / SECOND {s}{d:.1}ms", .{ if (width < 27) "" else " top ", peak }), colors.muted);
-    for ([_][60]?f64{ successes, failures }, 0..) |series, channel| for (series, 0..) |value, i| {
+    for ([_][60]?f64{ successes, failures, untimed }, 0..) |series, channel| for (series, 0..) |value, i| {
         const n = value orelse continue;
         const row: usize = @intFromFloat(@round(n / peak * @as(f64, @floatFromInt(height - 1))));
-        const col = plot_x + i * (plot_width - 1) / 59;
+        const col = x + i * (width - 1) / 59;
         const point_y = y + height - row;
         const previous = surface.readCell(col, point_y).char.grapheme;
-        const overlap = channel == 1 and (std.mem.eql(u8, previous, "•") or std.mem.eql(u8, previous, "⊗"));
+        const overlap = channel != 0 and (std.mem.eql(u8, previous, "•") or std.mem.eql(u8, previous, "⊗"));
         text(surface, ctx, col, point_y, 1, if (overlap) "⊗" else if (channel == 0) "•" else "×", if (overlap) colors.base else if (channel == 0) colors.accent else colors.danger);
     };
-    // This lane is outside the latency scale. A marker means at least one
-    // untimed failure in that second, not a zero-duration response.
-    text(surface, ctx, x, y + height + 1, gutter, "fail", colors.danger);
-    for (0..plot_width) |col| text(surface, ctx, plot_x + col, y + height + 1, 1, "─", colors.border);
-    for (untimed, 0..) |count, i| {
-        if (count != 0) text(surface, ctx, plot_x + i * (plot_width - 1) / 59, y + height + 1, 1, "×", colors.danger);
-    }
-    text(surface, ctx, plot_x, y + height + 2, plot_width, "-59s", colors.muted);
-    text(surface, ctx, plot_x + plot_width -| 3, y + height + 2, 3, "now", colors.muted);
-    text(surface, ctx, x, y + height + 3, @min(width, 6), "• OK", colors.accent);
-    if (width > 6) text(surface, ctx, x + 6, y + height + 3, @min(width - 6, 8), "× FAIL", colors.danger);
-    if (width > 14) text(surface, ctx, x + 14, y + height + 3, width - 14, "⊗ both", colors.base);
+    text(surface, ctx, x, y + height + 1, width, "-59s", colors.muted);
+    text(surface, ctx, x + width -| 3, y + height + 1, 3, "now", colors.muted);
+    text(surface, ctx, x, y + height + 2, @min(width, 6), "• OK", colors.accent);
+    if (width > 6) text(surface, ctx, x + 6, y + height + 2, @min(width - 6, 8), "× FAIL", colors.danger);
+    if (width > 14) text(surface, ctx, x + 14, y + height + 2, width - 14, "⊗ both", colors.base);
 }

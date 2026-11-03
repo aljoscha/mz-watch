@@ -221,7 +221,7 @@ test "timed outcomes have independent histograms, weighted means, gaps and expir
     try std.testing.expectEqual(@as(?f64, null), stats.mean(2000, .failure));
 }
 
-test "untimed failure lane has independent counts, gaps and expiry" {
+test "untimed failures have independent counts, gaps and expiry" {
     var stats: Stats = .{};
     stats.record(-1, .{ .failure = null });
     stats.record(0, .{ .success = 10 });
